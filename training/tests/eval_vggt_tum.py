@@ -102,7 +102,10 @@ def extract_camera_positions(poses, convention='w2c'):
 def compute_ate(pred_poses, gt_poses, align='sim3',
                 gt_convention='w2c', pred_convention='w2c'):
     """
-    Compute Absolute Trajectory Error.
+    Compute Absolute Trajectory Error (translation and rotation).
+
+    Reference: Zhang & Scaramuzza, "A Tutorial on Quantitative Trajectory
+    Evaluation for Visual(-Inertial) Odometry", IROS 2018.
 
     Args:
         pred_poses: (N, 3, 4) predicted poses
@@ -114,11 +117,15 @@ def compute_ate(pred_poses, gt_poses, align='sim3',
         pred_convention: 'w2c' or 'c2w' for predicted poses
 
     Returns:
-        ate_rmse: RMSE of position errors
-        ate_mean: mean position error
-        aligned_pred: aligned predicted positions
-        gt_positions: ground truth positions
-        scale: scale factor (1.0 if not using Sim3)
+        dict with keys:
+            'trans_rmse': RMSE of position errors (meters)
+            'trans_mean': mean position error (meters)
+            'rot_rmse': RMSE of rotation errors (degrees)
+            'rot_mean': mean rotation error (degrees)
+            'aligned_positions': aligned predicted positions
+            'gt_positions': ground truth positions
+            'scale': scale factor (1.0 if not using Sim3)
+            'R_align': alignment rotation matrix
     """
     pred_positions = extract_camera_positions(pred_poses, pred_convention)
     gt_positions = extract_camera_positions(gt_poses, gt_convention)
@@ -126,47 +133,90 @@ def compute_ate(pred_poses, gt_poses, align='sim3',
     if align == 'sim3':
         # Sim3 alignment (with scale)
         R_align, t_align, s_align = umeyama_alignment(gt_positions, pred_positions, with_scale=True)
-        aligned_pred = s_align * (pred_positions @ R_align.T) + t_align
+        aligned_positions = s_align * (pred_positions @ R_align.T) + t_align
     elif align == 'se3':
         # SE3 alignment (no scale)
         R_align, t_align, s_align = umeyama_alignment(gt_positions, pred_positions, with_scale=False)
-        aligned_pred = (pred_positions @ R_align.T) + t_align
+        aligned_positions = (pred_positions @ R_align.T) + t_align
         s_align = 1.0
     else:
-        aligned_pred = pred_positions
+        R_align = np.eye(3)
+        aligned_positions = pred_positions
         s_align = 1.0
 
-    # Compute errors
-    errors = np.linalg.norm(aligned_pred - gt_positions, axis=1)
-    ate_rmse = np.sqrt(np.mean(errors ** 2))
-    ate_mean = np.mean(errors)
+    # Translation errors
+    trans_errors = np.linalg.norm(aligned_positions - gt_positions, axis=1)
+    trans_rmse = np.sqrt(np.mean(trans_errors ** 2))
+    trans_mean = np.mean(trans_errors)
 
-    return ate_rmse, ate_mean, aligned_pred, gt_positions, s_align
+    # Rotation errors (after applying alignment rotation)
+    # For w2c rotation matrices: when world frame transforms by R_align,
+    # the camera rotation transforms as R_aligned = R_pred @ R_align.T
+    # (because p_cam = R_wc @ p_world, and p_world_gt = R_align @ p_world_pred)
+    rot_errors = []
+    for i in range(len(pred_poses)):
+        R_pred = pred_poses[i, :3, :3]
+        R_gt = gt_poses[i, :3, :3]
+        # Apply alignment rotation to predicted rotation (post-multiply by R_align.T)
+        R_pred_aligned = R_pred @ R_align.T
+        # Compute rotation error
+        rot_err = rotation_error(R_pred_aligned, R_gt)
+        rot_errors.append(rot_err)
+
+    rot_errors = np.array(rot_errors)
+    rot_rmse = np.sqrt(np.mean(rot_errors ** 2))
+    rot_mean = np.mean(rot_errors)
+
+    # Compute fully aligned poses (for RPE computation)
+    # For w2c: R_aligned = R_pred @ R_align.T, t_aligned = -R_aligned @ pos_aligned
+    aligned_poses = np.zeros_like(pred_poses)
+    for i in range(len(pred_poses)):
+        R_pred = pred_poses[i, :3, :3]
+        R_aligned = R_pred @ R_align.T
+        pos_aligned = aligned_positions[i]
+        t_aligned = -R_aligned @ pos_aligned
+        aligned_poses[i, :3, :3] = R_aligned
+        aligned_poses[i, :3, 3] = t_aligned
+
+    return {
+        'trans_rmse': trans_rmse,
+        'trans_mean': trans_mean,
+        'rot_rmse': rot_rmse,
+        'rot_mean': rot_mean,
+        'aligned_positions': aligned_positions,
+        'gt_positions': gt_positions,
+        'scale': s_align,
+        'R_align': R_align,
+        'aligned_poses': aligned_poses,  # Fully aligned w2c poses
+    }
 
 
 def rotation_error(R1, R2):
-    """Compute rotation error in degrees."""
+    """Compute rotation error in degrees between two rotation matrices."""
     R_diff = R1.T @ R2
     trace = np.clip((np.trace(R_diff) - 1) / 2, -1, 1)
     angle = np.arccos(trace) * 180 / np.pi
     return angle
 
 
-def compute_rpe(pred_poses, gt_poses, delta=1):
+def compute_rpe(pred_poses, gt_poses, delta=1, verbose=False):
     """
     Compute Relative Pose Error.
 
     Args:
-        pred_poses: (N, 3, 4) predicted poses
+        pred_poses: (N, 3, 4) predicted poses (should be aligned to GT frame if needed)
         gt_poses: (N, 3, 4) ground truth poses
         delta: frame interval for computing relative poses
+        verbose: if True, print diagnostic information
 
     Returns:
-        rpe_trans: mean relative translation error
+        rpe_trans: mean relative translation error (meters)
         rpe_rot: mean relative rotation error (degrees)
     """
     trans_errors = []
     rot_errors = []
+    gt_rel_trans_mags = []
+    pred_rel_trans_mags = []
 
     for i in range(len(pred_poses) - delta):
         # Predicted relative pose
@@ -190,6 +240,17 @@ def compute_rpe(pred_poses, gt_poses, delta=1):
         # Errors
         trans_errors.append(np.linalg.norm(t_rel_pred - t_rel_gt))
         rot_errors.append(rotation_error(R_rel_pred, R_rel_gt))
+
+        # Magnitudes for diagnostics
+        gt_rel_trans_mags.append(np.linalg.norm(t_rel_gt))
+        pred_rel_trans_mags.append(np.linalg.norm(t_rel_pred))
+
+    if verbose:
+        gt_rel_mean = np.mean(gt_rel_trans_mags)
+        pred_rel_mean = np.mean(pred_rel_trans_mags)
+        print(f"    [RPE Diagnostics] GT rel trans: {gt_rel_mean*100:.1f} cm, "
+              f"Pred rel trans: {pred_rel_mean*100:.1f} cm, "
+              f"Ratio pred/gt: {pred_rel_mean/gt_rel_mean:.3f}")
 
     return np.mean(trans_errors), np.mean(rot_errors)
 
@@ -311,39 +372,56 @@ def evaluate_sequence(dataset, seq_index, num_frames, model, device, dtype,
     # Reference: vggt/utils/pose_enc.py - "representing camera from world transformation"
     pose_convention = 'w2c'
 
-    # Compute ATE with Sim3 alignment
-    ate_rmse_sim3, _, aligned_pred_sim3, gt_pos, scale = compute_ate(
-        pred_poses, gt_poses, align='sim3', gt_convention=pose_convention, pred_convention=pose_convention)
+    # Compute ATE with Sim3 alignment (includes both translation and rotation errors)
+    ate_sim3 = compute_ate(pred_poses, gt_poses, align='sim3',
+                           gt_convention=pose_convention, pred_convention=pose_convention)
+    scale = ate_sim3['scale']
+    R_align = ate_sim3['R_align']
 
-    # Compute SE3 (no scale)
-    ate_rmse_se3, ate_mean_se3, _, _, _ = compute_ate(
-        pred_poses, gt_poses, align='se3', gt_convention=pose_convention, pred_convention=pose_convention)
-    ate_mean_sim3 = ate_rmse_sim3  # For now, use RMSE as mean approximation
+    # Compute ATE with SE3 alignment (no scale)
+    ate_se3 = compute_ate(pred_poses, gt_poses, align='se3',
+                          gt_convention=pose_convention, pred_convention=pose_convention)
 
-    # RPE (relative pose error)
-    rpe_trans, rpe_rot = compute_rpe(pred_poses, gt_poses, delta=1)
+    # RPE (relative pose error) - without and with Sim3 alignment
+    # Raw: compare pred vs GT directly (no alignment)
+    # Sim3: compare fully aligned pred vs GT
+    rpe_trans_raw, rpe_rot_raw = compute_rpe(pred_poses, gt_poses, delta=1)
+    print(f"\n  Relative Pose Error (δ=1, with Sim3 alignment):")
+    rpe_trans_sim3, rpe_rot_sim3 = compute_rpe(ate_sim3['aligned_poses'], gt_poses, delta=1, verbose=True)
 
-    print(f"\n  Results with SE3 alignment (no scale):")
-    print(f"    ATE RMSE: {ate_rmse_se3 * 100:.2f} cm")
+    print(f"\n  ATE - SE3 Alignment (no scale):")
+    print(f"    Trans RMSE: {ate_se3['trans_rmse'] * 100:.2f} cm")
+    print(f"    Rot RMSE:   {ate_se3['rot_rmse']:.2f}°")
 
-    print(f"\n  Results with Sim3 alignment (scale={scale:.3f}):")
-    print(f"    ATE RMSE: {ate_rmse_sim3 * 100:.2f} cm")
+    print(f"\n  ATE - Sim3 Alignment (with scale={scale:.3f}):")
+    print(f"    Trans RMSE: {ate_sim3['trans_rmse'] * 100:.2f} cm")
+    print(f"    Rot RMSE:   {ate_sim3['rot_rmse']:.2f}°")
 
-    print(f"\n  Relative Pose Error (δ=1):")
-    print(f"    RPE Trans: {rpe_trans * 100:.2f} cm")
-    print(f"    RPE Rot: {rpe_rot:.2f}°")
+    print(f"\n  RPE (δ=1) - No Alignment:")
+    print(f"    Trans: {rpe_trans_raw * 100:.2f} cm")
+    print(f"    Rot:   {rpe_rot_raw:.2f}°")
+
+    print(f"\n  RPE (δ=1) - Sim3 Alignment (with scale={scale:.3f}):")
+    print(f"    Trans: {rpe_trans_sim3 * 100:.2f} cm")
+    print(f"    Rot:   {rpe_rot_sim3:.2f}°")
 
     return {
-        'ate_rmse_se3': ate_rmse_se3,
-        'ate_mean_se3': ate_mean_se3,
-        'ate_rmse_sim3': ate_rmse_sim3,
-        'ate_mean_sim3': ate_mean_sim3,
-        'rpe_trans': rpe_trans,
+        'ate_trans_rmse_se3': ate_se3['trans_rmse'],
+        'ate_trans_mean_se3': ate_se3['trans_mean'],
+        'ate_rot_rmse_se3': ate_se3['rot_rmse'],
+        'ate_rot_mean_se3': ate_se3['rot_mean'],
+        'ate_trans_rmse_sim3': ate_sim3['trans_rmse'],
+        'ate_trans_mean_sim3': ate_sim3['trans_mean'],
+        'ate_rot_rmse_sim3': ate_sim3['rot_rmse'],
+        'ate_rot_mean_sim3': ate_sim3['rot_mean'],
+        'rpe_trans_raw': rpe_trans_raw,
+        'rpe_rot_raw': rpe_rot_raw,
+        'rpe_trans_sim3': rpe_trans_sim3,
+        'rpe_rot_sim3': rpe_rot_sim3,
         'pose_convention': pose_convention,
-        'rpe_rot': rpe_rot,
         'scale': scale,
-        'pred_positions': aligned_pred_sim3,
-        'gt_positions': gt_pos,
+        'pred_positions': ate_sim3['aligned_positions'],
+        'gt_positions': ate_sim3['gt_positions'],
         'vggt_predictions': vggt_predictions,
     }
 
@@ -437,26 +515,33 @@ def main():
         print("SUMMARY")
     print("="*60)
 
-    ate_rmses_se3 = [r['ate_rmse_se3'] for r in all_results]
-    ate_means_se3 = [r['ate_mean_se3'] for r in all_results]
-    ate_rmses_sim3 = [r['ate_rmse_sim3'] for r in all_results]
-    ate_means_sim3 = [r['ate_mean_sim3'] for r in all_results]
-    rpe_trans = [r['rpe_trans'] for r in all_results]
-    rpe_rots = [r['rpe_rot'] for r in all_results]
+    # Extract metrics from results
+    ate_trans_se3 = [r['ate_trans_rmse_se3'] for r in all_results]
+    ate_rot_se3 = [r['ate_rot_rmse_se3'] for r in all_results]
+    ate_trans_sim3 = [r['ate_trans_rmse_sim3'] for r in all_results]
+    ate_rot_sim3 = [r['ate_rot_rmse_sim3'] for r in all_results]
+    rpe_trans_raw = [r['rpe_trans_raw'] for r in all_results]
+    rpe_rots_raw = [r['rpe_rot_raw'] for r in all_results]
+    rpe_trans_sim3 = [r['rpe_trans_sim3'] for r in all_results]
+    rpe_rots_sim3 = [r['rpe_rot_sim3'] for r in all_results]
     scales = [r['scale'] for r in all_results]
 
-    print(f"\n[SE3 Alignment (no scale)]")
-    print(f"  ATE RMSE: {np.mean(ate_rmses_se3)*100:.2f} ± {np.std(ate_rmses_se3)*100:.2f} cm")
-    print(f"  ATE Mean: {np.mean(ate_means_se3)*100:.2f} ± {np.std(ate_means_se3)*100:.2f} cm")
+    print(f"\n[ATE - SE3 Alignment (no scale)]")
+    print(f"  Trans RMSE: {np.mean(ate_trans_se3)*100:.2f} ± {np.std(ate_trans_se3)*100:.2f} cm")
+    print(f"  Rot RMSE:   {np.mean(ate_rot_se3):.2f} ± {np.std(ate_rot_se3):.2f}°")
 
-    print(f"\n[Sim3 Alignment (with scale)]")
-    print(f"  ATE RMSE: {np.mean(ate_rmses_sim3)*100:.2f} ± {np.std(ate_rmses_sim3)*100:.2f} cm")
-    print(f"  ATE Mean: {np.mean(ate_means_sim3)*100:.2f} ± {np.std(ate_means_sim3)*100:.2f} cm")
-    print(f"  Scale factor: {np.mean(scales):.3f} ± {np.std(scales):.3f}")
+    print(f"\n[ATE - Sim3 Alignment (with scale)]")
+    print(f"  Trans RMSE: {np.mean(ate_trans_sim3)*100:.2f} ± {np.std(ate_trans_sim3)*100:.2f} cm")
+    print(f"  Rot RMSE:   {np.mean(ate_rot_sim3):.2f} ± {np.std(ate_rot_sim3):.2f}°")
+    print(f"  Scale:      {np.mean(scales):.3f} ± {np.std(scales):.3f}")
 
-    print(f"\n[Relative Pose Error]")
-    print(f"  RPE Trans: {np.mean(rpe_trans)*100:.2f} ± {np.std(rpe_trans)*100:.2f} cm")
-    print(f"  RPE Rot: {np.mean(rpe_rots):.2f} ± {np.std(rpe_rots):.2f}°")
+    print(f"\n[RPE - No Alignment]")
+    print(f"  Trans: {np.mean(rpe_trans_raw)*100:.2f} ± {np.std(rpe_trans_raw)*100:.2f} cm")
+    print(f"  Rot:   {np.mean(rpe_rots_raw):.2f} ± {np.std(rpe_rots_raw):.2f}°")
+
+    print(f"\n[RPE - Sim3 Alignment (with scale)]")
+    print(f"  Trans: {np.mean(rpe_trans_sim3)*100:.2f} ± {np.std(rpe_trans_sim3)*100:.2f} cm")
+    print(f"  Rot:   {np.mean(rpe_rots_sim3):.2f} ± {np.std(rpe_rots_sim3):.2f}°")
 
     # Save trajectory plot
     import matplotlib
@@ -483,7 +568,9 @@ def main():
     ax.set_zlabel('Z (m)')
     ax.legend()
     title_prefix = '[DRYRUN] GT vs GT' if args.dryrun else 'VGGT vs GT'
-    ax.set_title(f'{title_prefix} Trajectory\nATE (Sim3): {all_results[-1]["ate_rmse_sim3"]*100:.1f} cm')
+    ate_trans = all_results[-1]["ate_trans_rmse_sim3"] * 100
+    ate_rot = all_results[-1]["ate_rot_rmse_sim3"]
+    ax.set_title(f'{title_prefix} Trajectory (Sim3 aligned)\nATE: {ate_trans:.1f}cm trans, {ate_rot:.1f}° rot')
 
     plt.savefig(os.path.join(args.output_dir, 'trajectory_comparison.png'), dpi=150)
     plt.close()

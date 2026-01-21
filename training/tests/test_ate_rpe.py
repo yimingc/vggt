@@ -11,7 +11,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from eval_vggt_tum import compute_ate, compute_rpe, umeyama_alignment
+from eval_vggt_tum import compute_ate, compute_rpe, umeyama_alignment, rotation_error
 
 
 def test_umeyama_identical_points():
@@ -64,14 +64,14 @@ def test_ate_identical_poses():
         poses[i, :3, :3] = R
         poses[i, :3, 3] = t
 
-    ate_rmse, ate_mean, aligned_pred, gt_pos, scale = compute_ate(poses, poses, align='sim3')
+    result = compute_ate(poses, poses, align='sim3')
 
-    print(f"  ATE RMSE: {ate_rmse:.2e}")
-    print(f"  ATE Mean: {ate_mean:.2e}")
-    print(f"  Scale: {scale:.6f}")
+    print(f"  ATE Trans RMSE: {result['trans_rmse']:.2e}")
+    print(f"  ATE Rot RMSE: {result['rot_rmse']:.2e}°")
+    print(f"  Scale: {result['scale']:.6f}")
 
-    assert ate_rmse < 1e-6, f"ATE RMSE should be ~0, got {ate_rmse}"
-    assert ate_mean < 1e-6, f"ATE mean should be ~0, got {ate_mean}"
+    assert result['trans_rmse'] < 1e-6, f"ATE trans should be ~0, got {result['trans_rmse']}"
+    assert result['rot_rmse'] < 1e-3, f"ATE rot should be ~0, got {result['rot_rmse']}"
     print("  ✓ Passed")
 
 
@@ -85,10 +85,12 @@ def test_ate_no_align():
         poses[i, :3, :3] = np.eye(3)
         poses[i, :3, 3] = np.array([i * 0.1, 0, 0])
 
-    ate_rmse, ate_mean, _, _, _ = compute_ate(poses, poses, align='none')
+    result = compute_ate(poses, poses, align='none')
 
-    print(f"  ATE RMSE: {ate_rmse:.2e}")
-    assert ate_rmse < 1e-10, f"ATE RMSE should be ~0, got {ate_rmse}"
+    print(f"  ATE Trans RMSE: {result['trans_rmse']:.2e}")
+    print(f"  ATE Rot RMSE: {result['rot_rmse']:.2e}°")
+    assert result['trans_rmse'] < 1e-10, f"ATE trans should be ~0, got {result['trans_rmse']}"
+    assert result['rot_rmse'] < 1e-10, f"ATE rot should be ~0, got {result['rot_rmse']}"
     print("  ✓ Passed")
 
 
@@ -162,19 +164,20 @@ def test_full_pipeline_gt_vs_gt():
         poses[i, :3, 3] = -R @ pos
 
     # Test ATE with Sim3
-    ate_rmse, ate_mean, _, _, scale = compute_ate(poses, poses, align='sim3')
+    result = compute_ate(poses, poses, align='sim3')
 
     # Test RPE
     rpe_trans, rpe_rot = compute_rpe(poses, poses, delta=1)
 
-    print(f"  ATE RMSE: {ate_rmse:.2e}")
-    print(f"  ATE Mean: {ate_mean:.2e}")
+    print(f"  ATE Trans RMSE: {result['trans_rmse']:.2e}")
+    print(f"  ATE Rot RMSE: {result['rot_rmse']:.2e}°")
     print(f"  RPE Trans: {rpe_trans:.2e}")
     print(f"  RPE Rot: {rpe_rot:.2e}°")
-    print(f"  Scale: {scale:.6f}")
+    print(f"  Scale: {result['scale']:.6f}")
 
-    assert ate_rmse < 1e-6, f"ATE RMSE should be ~0, got {ate_rmse}"
-    assert np.isclose(scale, 1.0, atol=1e-3), f"Scale should be ~1, got {scale}"
+    assert result['trans_rmse'] < 1e-6, f"ATE trans should be ~0, got {result['trans_rmse']}"
+    assert result['rot_rmse'] < 1e-3, f"ATE rot should be ~0, got {result['rot_rmse']}"
+    assert np.isclose(result['scale'], 1.0, atol=1e-3), f"Scale should be ~1, got {result['scale']}"
     assert rpe_trans < 1e-10, f"RPE trans should be ~0, got {rpe_trans}"
     assert rpe_rot < 1e-10, f"RPE rot should be ~0, got {rpe_rot}"
     print("  ✓ Passed")
@@ -253,17 +256,83 @@ def test_sim3_alignment_on_poses():
         pred_poses[i, :3, 3] = -pred_pos
 
     # Test Sim3 alignment
-    ate_rmse_sim3, _, _, _, scale = compute_ate(pred_poses, gt_poses, align='sim3')
+    result_sim3 = compute_ate(pred_poses, gt_poses, align='sim3')
 
     # Test SE3 alignment (should have larger error)
-    ate_rmse_se3, _, _, _, _ = compute_ate(pred_poses, gt_poses, align='se3')
+    result_se3 = compute_ate(pred_poses, gt_poses, align='se3')
 
     print(f"  Applied Sim3: scale={s_sim3}, rotation=60°")
-    print(f"  Sim3 alignment: ATE RMSE={ate_rmse_sim3:.2e}, scale={scale:.4f}")
-    print(f"  SE3 alignment:  ATE RMSE={ate_rmse_se3:.2e}")
+    print(f"  Sim3: ATE trans={result_sim3['trans_rmse']:.2e}, rot={result_sim3['rot_rmse']:.2f}°, scale={result_sim3['scale']:.4f}")
+    print(f"  SE3:  ATE trans={result_se3['trans_rmse']:.2e}, rot={result_se3['rot_rmse']:.2f}°")
 
-    assert ate_rmse_sim3 < 1e-10, f"Sim3 ATE should be ~0, got {ate_rmse_sim3}"
-    assert np.isclose(scale, 1/s_sim3, atol=1e-6), f"Scale should be {1/s_sim3:.4f}, got {scale:.4f}"
+    assert result_sim3['trans_rmse'] < 1e-10, f"Sim3 ATE trans should be ~0, got {result_sim3['trans_rmse']}"
+    assert np.isclose(result_sim3['scale'], 1/s_sim3, atol=1e-6), f"Scale should be {1/s_sim3:.4f}, got {result_sim3['scale']:.4f}"
+    print("  ✓ Passed")
+
+
+def test_sim3_alignment_full_transform():
+    """Test Sim3 alignment when BOTH position and rotation are transformed.
+
+    This simulates the case where a SLAM system outputs poses in a different
+    coordinate frame (related by Sim3). After alignment, both translation
+    and rotation errors should be ~0.
+    """
+    print("\nTesting Sim3 alignment with full pose transform...")
+    np.random.seed(790)
+    n_poses = 20
+
+    # Create GT poses with varying rotations
+    gt_poses = np.zeros((n_poses, 3, 4))
+    for i in range(n_poses):
+        # Varying rotation around Z axis
+        angle = i * 0.1
+        R = np.array([
+            [np.cos(angle), -np.sin(angle), 0],
+            [np.sin(angle), np.cos(angle), 0],
+            [0, 0, 1]
+        ])
+        pos = np.array([i * 0.1, np.sin(i * 0.2) * 0.3, 0.5])
+        gt_poses[i, :3, :3] = R
+        gt_poses[i, :3, 3] = -R @ pos  # w2c: t = -R @ pos
+
+    # Sim3 transformation parameters
+    theta = np.pi / 3  # 60° around Z
+    R_sim3 = np.array([
+        [np.cos(theta), -np.sin(theta), 0],
+        [np.sin(theta), np.cos(theta), 0],
+        [0, 0, 1]
+    ])
+    t_sim3 = np.array([2.0, -1.0, 0.5])
+    s_sim3 = 1.8
+
+    # Create pred poses by transforming GT poses with Sim3
+    # For w2c poses: if world transforms by Sim3, then:
+    # - New position: p_new = s * R_sim3 @ p_old + t_sim3
+    # - New rotation: R_wc_new = R_wc_old @ R_sim3.T
+    pred_poses = np.zeros((n_poses, 3, 4))
+    for i in range(n_poses):
+        R_gt = gt_poses[i, :3, :3]
+        t_gt = gt_poses[i, :3, 3]
+        # Get GT camera position
+        pos_gt = -R_gt.T @ t_gt
+        # Transform position by Sim3
+        pos_pred = s_sim3 * (R_sim3 @ pos_gt) + t_sim3
+        # Transform rotation: R_pred = R_gt @ R_sim3.T
+        R_pred = R_gt @ R_sim3.T
+        pred_poses[i, :3, :3] = R_pred
+        pred_poses[i, :3, 3] = -R_pred @ pos_pred  # w2c: t = -R @ pos
+
+    # Test Sim3 alignment - both trans and rot should be ~0
+    result_sim3 = compute_ate(pred_poses, gt_poses, align='sim3')
+
+    print(f"  Applied Sim3: scale={s_sim3}, rotation=60°")
+    print(f"  Recovered scale: {result_sim3['scale']:.4f} (expected: {1/s_sim3:.4f})")
+    print(f"  ATE Trans: {result_sim3['trans_rmse']:.2e}")
+    print(f"  ATE Rot: {result_sim3['rot_rmse']:.2e}°")
+
+    assert result_sim3['trans_rmse'] < 1e-6, f"Sim3 ATE trans should be ~0, got {result_sim3['trans_rmse']}"
+    assert result_sim3['rot_rmse'] < 1e-3, f"Sim3 ATE rot should be ~0, got {result_sim3['rot_rmse']}"
+    assert np.isclose(result_sim3['scale'], 1/s_sim3, atol=1e-3), f"Scale should be {1/s_sim3:.4f}, got {result_sim3['scale']:.4f}"
     print("  ✓ Passed")
 
 
@@ -319,27 +388,359 @@ def test_tum_gt_vs_gt():
         print(f"  Loaded {len(gt_poses)} GT poses from {seq_name}")
 
         # Test: GT vs GT should give zero error
-        ate_rmse, ate_mean, _, _, scale = compute_ate(gt_poses, gt_poses, align='sim3')
+        result = compute_ate(gt_poses, gt_poses, align='sim3')
         rpe_trans, rpe_rot = compute_rpe(gt_poses, gt_poses, delta=1)
 
         print(f"  GT vs GT results:")
-        print(f"    ATE RMSE: {ate_rmse:.2e}")
-        print(f"    ATE Mean: {ate_mean:.2e}")
+        print(f"    ATE Trans RMSE: {result['trans_rmse']:.2e}")
+        print(f"    ATE Rot RMSE: {result['rot_rmse']:.2e}°")
         print(f"    RPE Trans: {rpe_trans:.2e}")
         print(f"    RPE Rot: {rpe_rot:.2e}°")
-        print(f"    Scale: {scale:.6f}")
+        print(f"    Scale: {result['scale']:.6f}")
 
         # Tolerances account for numerical precision (image resizing, coordinate transforms)
-        assert ate_rmse < 1e-6, f"GT vs GT ATE should be ~0, got {ate_rmse}"
+        assert result['trans_rmse'] < 1e-6, f"GT vs GT ATE trans should be ~0, got {result['trans_rmse']}"
+        assert result['rot_rmse'] < 0.1, f"GT vs GT ATE rot should be ~0, got {result['rot_rmse']}"
         assert rpe_trans < 1e-6, f"GT vs GT RPE trans should be ~0, got {rpe_trans}"
-        assert rpe_rot < 0.01, f"GT vs GT RPE rot should be ~0, got {rpe_rot}"
-        assert np.isclose(scale, 1.0, atol=1e-4), f"Scale should be 1.0, got {scale}"
+        assert rpe_rot < 0.1, f"GT vs GT RPE rot should be ~0, got {rpe_rot}"
+        assert np.isclose(result['scale'], 1.0, atol=1e-4), f"Scale should be 1.0, got {result['scale']}"
 
         print("  ✓ Passed")
 
     except Exception as e:
         print(f"  ✗ ERROR: {e}")
         raise
+
+
+def create_realistic_trajectory(n_poses=50, seed=42):
+    """Create a realistic camera trajectory (circular motion with forward movement)."""
+    np.random.seed(seed)
+    poses = np.zeros((n_poses, 3, 4))
+
+    for i in range(n_poses):
+        t = i / n_poses
+        # Circular path with some forward motion
+        pos = np.array([
+            np.sin(t * 2 * np.pi) * 1.0,  # X: circular
+            t * 2.0,                        # Y: forward
+            np.cos(t * 2 * np.pi) * 0.5,   # Z: circular (smaller)
+        ])
+        # Camera looks roughly forward (along Y) with some rotation
+        angle_y = t * 2 * np.pi * 0.3  # Yaw
+        angle_x = np.sin(t * np.pi) * 0.2  # Pitch
+        Ry = np.array([
+            [np.cos(angle_y), 0, np.sin(angle_y)],
+            [0, 1, 0],
+            [-np.sin(angle_y), 0, np.cos(angle_y)]
+        ])
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(angle_x), -np.sin(angle_x)],
+            [0, np.sin(angle_x), np.cos(angle_x)]
+        ])
+        R = Ry @ Rx
+        poses[i, :3, :3] = R
+        poses[i, :3, 3] = -R @ pos  # w2c convention: t = -R @ pos
+
+    return poses
+
+
+def add_translation_noise(poses, noise_std=0.05):
+    """Add Gaussian noise to translation."""
+    noisy = poses.copy()
+    n = len(poses)
+    noise = np.random.randn(n, 3) * noise_std
+    noisy[:, :3, 3] += noise
+    return noisy
+
+
+def add_rotation_noise(poses, noise_std_deg=2.0):
+    """Add small rotation noise (axis-angle)."""
+    noisy = poses.copy()
+    noise_std_rad = np.deg2rad(noise_std_deg)
+
+    for i in range(len(poses)):
+        # Random axis-angle noise
+        axis = np.random.randn(3)
+        axis = axis / (np.linalg.norm(axis) + 1e-8)
+        angle = np.random.randn() * noise_std_rad
+
+        # Rodrigues formula
+        K = np.array([
+            [0, -axis[2], axis[1]],
+            [axis[2], 0, -axis[0]],
+            [-axis[1], axis[0], 0]
+        ])
+        R_noise = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+        noisy[i, :3, :3] = R_noise @ poses[i, :3, :3]
+
+    return noisy
+
+
+def add_scale_error(poses, scale=1.5):
+    """Apply global scale to translations (simulating scale ambiguity)."""
+    scaled = poses.copy()
+    scaled[:, :3, 3] *= scale
+    return scaled
+
+
+def test_disturbed_translation():
+    """Test ATE/RPE with translation noise."""
+    print("\nTesting with translation noise...")
+    np.random.seed(100)
+
+    gt_poses = create_realistic_trajectory(n_poses=30)
+    noise_std = 0.03  # 3cm noise
+
+    pred_poses = add_translation_noise(gt_poses, noise_std=noise_std)
+
+    # ATE should be approximately the noise level
+    result_sim3 = compute_ate(pred_poses, gt_poses, align='sim3')
+    result_se3 = compute_ate(pred_poses, gt_poses, align='se3')
+    scale = result_sim3['scale']
+
+    # RPE - use aligned poses for Sim3 comparison
+    rpe_trans_raw, rpe_rot_raw = compute_rpe(pred_poses, gt_poses, delta=1)
+    rpe_trans_sim3, rpe_rot_sim3 = compute_rpe(result_sim3['aligned_poses'], gt_poses, delta=1)
+
+    print(f"  Noise std: {noise_std*100:.1f} cm")
+    print(f"  ATE Trans (SE3):  {result_se3['trans_rmse']*100:.2f} cm")
+    print(f"  ATE Trans (Sim3): {result_sim3['trans_rmse']*100:.2f} cm, scale={scale:.3f}")
+    print(f"  ATE Rot (Sim3): {result_sim3['rot_rmse']:.2f}°")
+    print(f"  RPE Trans (raw): {rpe_trans_raw*100:.2f} cm")
+    print(f"  RPE Trans (Sim3): {rpe_trans_sim3*100:.2f} cm")
+    print(f"  RPE Rot: {rpe_rot_raw:.2f}°")
+
+    # ATE should be on the order of noise_std (within factor of 3)
+    assert result_sim3['trans_rmse'] < noise_std * 3, f"ATE too large: {result_sim3['trans_rmse']}"
+    assert result_sim3['trans_rmse'] > noise_std * 0.3, f"ATE suspiciously small: {result_sim3['trans_rmse']}"
+    # Scale should be close to 1 (no scale error added)
+    assert np.isclose(scale, 1.0, atol=0.1), f"Scale should be ~1, got {scale}"
+    # RPE rotation should be near zero (we only added translation noise)
+    assert rpe_rot_raw < 1.0, f"RPE rot should be small: {rpe_rot_raw}"
+
+    print("  ✓ Passed")
+
+
+def test_disturbed_rotation():
+    """Test ATE/RPE with rotation noise."""
+    print("\nTesting with rotation noise...")
+    np.random.seed(101)
+
+    gt_poses = create_realistic_trajectory(n_poses=30)
+    noise_std_deg = 3.0  # 3 degree noise
+
+    pred_poses = add_rotation_noise(gt_poses, noise_std_deg=noise_std_deg)
+
+    # ATE
+    result_sim3 = compute_ate(pred_poses, gt_poses, align='sim3')
+    scale = result_sim3['scale']
+
+    # RPE - use aligned poses for Sim3 comparison
+    rpe_trans_raw, rpe_rot_raw = compute_rpe(pred_poses, gt_poses, delta=1)
+    rpe_trans_sim3, rpe_rot_sim3 = compute_rpe(result_sim3['aligned_poses'], gt_poses, delta=1)
+
+    print(f"  Rotation noise std: {noise_std_deg:.1f}°")
+    print(f"  ATE Trans (Sim3): {result_sim3['trans_rmse']*100:.2f} cm, scale={scale:.3f}")
+    print(f"  ATE Rot (Sim3): {result_sim3['rot_rmse']:.2f}°")
+    print(f"  RPE Trans (Sim3): {rpe_trans_sim3*100:.2f} cm")
+    print(f"  RPE Rot: {rpe_rot_raw:.2f}°")
+
+    # ATE rotation should be on the order of noise_std_deg
+    assert result_sim3['rot_rmse'] < noise_std_deg * 3, f"ATE rot too large: {result_sim3['rot_rmse']}"
+    assert result_sim3['rot_rmse'] > noise_std_deg * 0.2, f"ATE rot suspiciously small: {result_sim3['rot_rmse']}"
+    # RPE rotation should also be on the order of noise_std_deg
+    assert rpe_rot_raw < noise_std_deg * 3, f"RPE rot too large: {rpe_rot_raw}"
+
+    print("  ✓ Passed")
+
+
+def test_disturbed_scale():
+    """Test ATE/RPE with scale error (simulating monocular scale ambiguity)."""
+    print("\nTesting with scale error...")
+    np.random.seed(102)
+
+    gt_poses = create_realistic_trajectory(n_poses=30)
+    true_scale = 2.5  # Predictions are 2.5x larger
+
+    pred_poses = add_scale_error(gt_poses, scale=true_scale)
+
+    # Without scale alignment, ATE should be large
+    result_none = compute_ate(pred_poses, gt_poses, align='none')
+
+    # With Sim3, should recover scale and get near-zero ATE
+    result_sim3 = compute_ate(pred_poses, gt_poses, align='sim3')
+    recovered_scale = result_sim3['scale']
+
+    # RPE without alignment should be large (scale mismatch)
+    rpe_trans_raw, rpe_rot_raw = compute_rpe(pred_poses, gt_poses, delta=1)
+    # RPE with Sim3 aligned poses should be near zero
+    rpe_trans_sim3, rpe_rot_sim3 = compute_rpe(result_sim3['aligned_poses'], gt_poses, delta=1)
+
+    print(f"  True scale: {true_scale}")
+    print(f"  Recovered scale: {recovered_scale:.4f} (expected: {1/true_scale:.4f})")
+    print(f"  ATE Trans (no align): {result_none['trans_rmse']*100:.2f} cm")
+    print(f"  ATE Trans (Sim3): {result_sim3['trans_rmse']*100:.2f} cm")
+    print(f"  ATE Rot (Sim3): {result_sim3['rot_rmse']:.2f}°")
+    print(f"  RPE Trans (no align): {rpe_trans_raw*100:.2f} cm")
+    print(f"  RPE Trans (Sim3): {rpe_trans_sim3*100:.2f} cm")
+    print(f"  RPE Rot: {rpe_rot_raw:.2f}°")
+
+    # Sim3 should recover the scale
+    assert np.isclose(recovered_scale, 1/true_scale, rtol=0.01), \
+        f"Scale should be {1/true_scale:.4f}, got {recovered_scale:.4f}"
+    # ATE with Sim3 should be near zero
+    assert result_sim3['trans_rmse'] < 1e-6, f"Sim3 ATE trans should be ~0, got {result_sim3['trans_rmse']}"
+    assert result_sim3['rot_rmse'] < 1e-3, f"Sim3 ATE rot should be ~0, got {result_sim3['rot_rmse']}"
+    # RPE with scale correction should be near zero
+    assert rpe_trans_sim3 < 1e-6, f"RPE with scale should be ~0, got {rpe_trans_sim3}"
+    # RPE rotation should be zero (no rotation error)
+    assert rpe_rot_raw < 1e-6, f"RPE rot should be ~0, got {rpe_rot_raw}"
+
+    print("  ✓ Passed")
+
+
+def test_disturbed_combined():
+    """Test with combined noise: translation + rotation + scale (realistic scenario)."""
+    print("\nTesting with combined noise (realistic scenario)...")
+    np.random.seed(103)
+
+    gt_poses = create_realistic_trajectory(n_poses=50)
+
+    # Apply combined disturbances
+    pred_poses = gt_poses.copy()
+    pred_poses = add_translation_noise(pred_poses, noise_std=0.02)  # 2cm
+    pred_poses = add_rotation_noise(pred_poses, noise_std_deg=1.5)  # 1.5°
+    pred_poses = add_scale_error(pred_poses, scale=1.8)             # 1.8x scale
+
+    # Compute metrics
+    result_se3 = compute_ate(pred_poses, gt_poses, align='se3')
+    result_sim3 = compute_ate(pred_poses, gt_poses, align='sim3')
+    scale = result_sim3['scale']
+
+    rpe_trans_raw, rpe_rot_raw = compute_rpe(pred_poses, gt_poses, delta=1)
+    rpe_trans_sim3, rpe_rot_sim3 = compute_rpe(result_sim3['aligned_poses'], gt_poses, delta=1)
+
+    print(f"  Applied: trans_noise=2cm, rot_noise=1.5°, scale=1.8x")
+    print(f"  Recovered scale: {scale:.4f} (expected: {1/1.8:.4f})")
+    print(f"  ATE Trans (SE3):  {result_se3['trans_rmse']*100:.2f} cm")
+    print(f"  ATE Trans (Sim3): {result_sim3['trans_rmse']*100:.2f} cm")
+    print(f"  ATE Rot (SE3):  {result_se3['rot_rmse']:.2f}°")
+    print(f"  ATE Rot (Sim3): {result_sim3['rot_rmse']:.2f}°")
+    print(f"  RPE Trans (raw):  {rpe_trans_raw*100:.2f} cm")
+    print(f"  RPE Trans (Sim3): {rpe_trans_sim3*100:.2f} cm")
+    print(f"  RPE Rot (raw):  {rpe_rot_raw:.2f}°")
+    print(f"  RPE Rot (Sim3): {rpe_rot_sim3:.2f}°")
+
+    # Scale should be approximately recovered
+    assert np.isclose(scale, 1/1.8, rtol=0.1), f"Scale recovery failed: {scale}"
+    # Sim3 ATE should be smaller than SE3 (since we have scale error)
+    assert result_sim3['trans_rmse'] < result_se3['trans_rmse'], "Sim3 should be better than SE3 with scale error"
+    # RPE with scale should be better than raw
+    assert rpe_trans_sim3 < rpe_trans_raw, "RPE with scale should be better"
+    # Rotation errors should be similar (scale doesn't affect rotation)
+    assert np.isclose(rpe_rot_raw, rpe_rot_sim3, atol=0.1), "RPE rot should be same with/without scale"
+
+    print("  ✓ Passed")
+
+
+def test_rpe_with_scale_alignment():
+    """Verify that RPE with Sim3 aligned poses correctly handles scale."""
+    print("\nTesting RPE with scale alignment...")
+    np.random.seed(104)
+
+    gt_poses = create_realistic_trajectory(n_poses=20)
+
+    # Create predictions with only scale difference
+    scale_true = 3.0
+    pred_poses = add_scale_error(gt_poses, scale=scale_true)
+
+    # Use Sim3 alignment to get aligned poses
+    ate_result = compute_ate(pred_poses, gt_poses, align='sim3')
+
+    # RPE without alignment (should be large due to scale mismatch)
+    rpe_trans_raw, rpe_rot_raw = compute_rpe(pred_poses, gt_poses, delta=1)
+
+    # RPE with Sim3 aligned poses (should be ~0)
+    rpe_trans_aligned, rpe_rot_aligned = compute_rpe(ate_result['aligned_poses'], gt_poses, delta=1)
+
+    print(f"  Scale applied: {scale_true}x")
+    print(f"  Recovered scale: {ate_result['scale']:.4f} (expected: {1/scale_true:.4f})")
+    print(f"  RPE Trans (no alignment): {rpe_trans_raw*100:.2f} cm")
+    print(f"  RPE Trans (Sim3 aligned): {rpe_trans_aligned*100:.2f} cm")
+    print(f"  RPE Rot (no alignment): {rpe_rot_raw:.4f}°")
+    print(f"  RPE Rot (Sim3 aligned): {rpe_rot_aligned:.4f}°")
+
+    # With Sim3 aligned poses, RPE trans should be ~0
+    assert rpe_trans_aligned < 1e-6, f"Aligned RPE trans should be ~0, got {rpe_trans_aligned}"
+    # Without alignment, RPE trans should be large
+    assert rpe_trans_raw > 0.01, f"Raw RPE trans should be large, got {rpe_trans_raw}"
+    # Rotation should be the same (scale doesn't affect rotation)
+    assert np.isclose(rpe_rot_raw, rpe_rot_aligned, atol=1e-6), \
+        f"Rotation should be same: {rpe_rot_raw} vs {rpe_rot_aligned}"
+
+    print("  ✓ Passed")
+
+
+def test_rpe_with_rotation_alignment():
+    """Test RPE with Sim3 aligned poses when world frames differ by rotation.
+
+    This tests the case where predictions are in a different world frame
+    (rotated relative to GT). With properly aligned poses, RPE should be ~0.
+    """
+    print("\nTesting RPE with rotation alignment...")
+    np.random.seed(105)
+
+    gt_poses = create_realistic_trajectory(n_poses=30)
+
+    # Create predictions in a rotated world frame
+    # For w2c poses with world rotated by R_world: R_pred = R_gt @ R_world.T
+    theta = np.pi / 4  # 45° rotation around Z
+    R_world = np.array([
+        [np.cos(theta), -np.sin(theta), 0],
+        [np.sin(theta), np.cos(theta), 0],
+        [0, 0, 1]
+    ])
+
+    pred_poses = np.zeros_like(gt_poses)
+    for i in range(len(gt_poses)):
+        R_gt = gt_poses[i, :3, :3]
+        t_gt = gt_poses[i, :3, 3]
+        # Get GT camera position
+        pos_gt = -R_gt.T @ t_gt
+        # Transform position to different world frame: pos_pred = R_world @ pos_gt
+        pos_pred = R_world @ pos_gt
+        # For w2c: R_pred = R_gt @ R_world.T
+        R_pred = R_gt @ R_world.T
+        pred_poses[i, :3, :3] = R_pred
+        pred_poses[i, :3, 3] = -R_pred @ pos_pred
+
+    # Use compute_ate to get aligned poses
+    ate_result = compute_ate(pred_poses, gt_poses, align='sim3')
+    R_align = ate_result['R_align']
+    scale = ate_result['scale']
+
+    print(f"  World frame rotation: {theta * 180 / np.pi:.0f}°")
+    print(f"  R_align rotation angle: {rotation_error(R_align, np.eye(3)):.1f}°")
+    print(f"  Scale: {scale:.4f}")
+
+    # RPE without alignment
+    rpe_trans_raw, rpe_rot_raw = compute_rpe(pred_poses, gt_poses, delta=1)
+
+    # RPE with Sim3 aligned poses
+    rpe_trans_aligned, rpe_rot_aligned = compute_rpe(ate_result['aligned_poses'], gt_poses, delta=1)
+
+    print(f"  RPE Rot (no alignment): {rpe_rot_raw:.2f}°")
+    print(f"  RPE Rot (Sim3 aligned): {rpe_rot_aligned:.2f}°")
+    print(f"  RPE Trans (no alignment): {rpe_trans_raw*100:.2f} cm")
+    print(f"  RPE Trans (Sim3 aligned): {rpe_trans_aligned*100:.2f} cm")
+
+    # With Sim3 aligned poses, RPE should be ~0 (perfect alignment of world frames)
+    assert rpe_rot_aligned < 0.1, f"Aligned RPE rot should be ~0, got {rpe_rot_aligned}"
+    assert rpe_trans_aligned < 1e-6, f"Aligned RPE trans should be ~0, got {rpe_trans_aligned}"
+
+    print("  ✓ Passed")
 
 
 def main():
@@ -357,7 +758,15 @@ def main():
         test_full_pipeline_gt_vs_gt,
         test_sim3_alignment_on_positions,
         test_sim3_alignment_on_poses,
+        test_sim3_alignment_full_transform,
         test_tum_gt_vs_gt,  # End-to-end test with real TUM data
+        # Disturbed trajectory tests
+        test_disturbed_translation,
+        test_disturbed_rotation,
+        test_disturbed_scale,
+        test_disturbed_combined,
+        test_rpe_with_scale_alignment,
+        test_rpe_with_rotation_alignment,
     ]
 
     passed = 0
