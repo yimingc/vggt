@@ -146,8 +146,9 @@ Rotation and translation have different units and scales:
 - Translation residuals are in meters (scale-dependent)
 
 ```python
-sqrt_info_rot = sqrt_info[..., :3].clamp(min=0.1, max=200.0)   # ~σ_r in [0.005, 10] rad
-sqrt_info_trans = sqrt_info[..., 3:].clamp(min=0.1, max=100.0) # adjust based on scale
+# PyPose convention: [:3] = translation, [3:] = rotation
+sqrt_info_trans = sqrt_info[..., :3].clamp(min=0.1, max=100.0) # adjust based on scale
+sqrt_info_rot = sqrt_info[..., 3:].clamp(min=0.1, max=200.0)   # ~σ_r in [0.005, 10] rad
 ```
 
 ### 5. What We're NOT Doing in v1
@@ -177,27 +178,27 @@ T = pp.SE3(se3_vec)
 ### Log Map Output Format
 
 ```python
-# Log map returns 6-dim: [wx, wy, wz, vx, vy, vz]
+# Log map returns 6-dim: [vx, vy, vz, wx, wy, wz]
 xi = T.Log()
 #     ├─ :3 ──┤  ├─ 3: ──┤
-#     rotation   translation
-#     (radians)  (meters)
+#     translation  rotation
+#     (meters)     (radians)
 ```
 
 ### Dimension Convention (MUST MATCH!)
 
 ```
-residual = [wx, wy, wz, vx, vy, vz]
+residual = [vx, vy, vz, wx, wy, wz]
            ├─ :3 ──┤  ├─ 3: ──┤
-           rotation   translation
-           (radians)  (meters)
+           translation  rotation
+           (meters)     (radians)
 
-sqrt_info = [√λ_wx, √λ_wy, √λ_wz, √λ_vx, √λ_vy, √λ_vz]
+sqrt_info = [√λ_vx, √λ_vy, √λ_vz, √λ_wx, √λ_wy, √λ_wz]
             ├──── :3 ─────┤  ├──── 3: ─────┤
-            rotation info    translation info
+            translation info   rotation info
 ```
 
-**Rule:** Always slice as `[..., :3]` for rot, `[..., 3:]` for trans. **NEVER mix!**
+**Rule:** Always slice as `[..., :3]` for trans, `[..., 3:]` for rot. **NEVER mix!**
 
 ---
 
@@ -310,7 +311,8 @@ def compute_se3_residual(T_rel_pred: pp.SE3, T_rel_gt: pp.SE3) -> torch.Tensor:
         T_rel_gt: pp.SE3 [B, S] GT relative poses
 
     Returns:
-        residual: [B, S, 6] in se(3) [wx, wy, wz, vx, vy, vz]
+        residual: [B, S, 6] in se(3) [vx, vy, vz, wx, wy, wz]
+                  [:3] = translation (meters), [3:] = rotation (radians)
     """
     T_err = T_rel_gt.Inv() @ T_rel_pred
     residual = T_err.Log()  # [B, S, 6]
@@ -431,8 +433,8 @@ def compute_camera_nll_loss(
         # Step 4: Compute SE(3) residual: r = Log(inv(T_gt) @ T_pred)
         residual = compute_se3_residual(T_rel_pred_scaled, T_rel_gt)  # [B, S, 6]
         # DIMENSION CONVENTION (PyPose Log output):
-        #   residual[..., :3] = rotation (wx, wy, wz) in radians
-        #   residual[..., 3:] = translation (vx, vy, vz) in meters
+        #   residual[..., :3] = translation (vx, vy, vz) in meters
+        #   residual[..., 3:] = rotation (wx, wy, wz) in radians
 
         # Step 5: Skip frame 0 (identity, residual=0)
         residual = residual[:, 1:]      # [B, S-1, 6]
@@ -443,15 +445,15 @@ def compute_camera_nll_loss(
         sqrt_info_positive = F.softplus(sqrt_info_raw) + eps  # Always positive!
 
         # DIMENSION CONVENTION (must match residual!):
-        #   sqrt_info[..., :3] = rotation uncertainty (√λ for wx, wy, wz)
-        #   sqrt_info[..., 3:] = translation uncertainty (√λ for vx, vy, vz)
-        sqrt_info_rot = sqrt_info_positive[..., :3].clamp(
-            min=sqrt_info_rot_clamp[0], max=sqrt_info_rot_clamp[1]
-        )
-        sqrt_info_trans = sqrt_info_positive[..., 3:].clamp(
+        #   sqrt_info[..., :3] = translation uncertainty (√λ for vx, vy, vz)
+        #   sqrt_info[..., 3:] = rotation uncertainty (√λ for wx, wy, wz)
+        sqrt_info_trans = sqrt_info_positive[..., :3].clamp(
             min=sqrt_info_trans_clamp[0], max=sqrt_info_trans_clamp[1]
         )
-        sqrt_info_clamped = torch.cat([sqrt_info_rot, sqrt_info_trans], dim=-1)
+        sqrt_info_rot = sqrt_info_positive[..., 3:].clamp(
+            min=sqrt_info_rot_clamp[0], max=sqrt_info_rot_clamp[1]
+        )
+        sqrt_info_clamped = torch.cat([sqrt_info_trans, sqrt_info_rot], dim=-1)
 
         # Step 7: NLL loss
         residual_sq = residual ** 2
@@ -470,22 +472,23 @@ def compute_camera_nll_loss(
             scale_last = scale
 
     # Compute separate rot/trans NLL for logging (last stage only)
-    nll_rot = 0.5 * (residual_sq_last[..., :3] * lambda_diag_last[..., :3]
-                     - 2 * torch.log(sqrt_info_last[..., :3] + eps))
-    nll_trans = 0.5 * (residual_sq_last[..., 3:] * lambda_diag_last[..., 3:]
-                       - 2 * torch.log(sqrt_info_last[..., 3:] + eps))
+    # Remember: [:3] = translation, [3:] = rotation
+    nll_trans = 0.5 * (residual_sq_last[..., :3] * lambda_diag_last[..., :3]
+                       - 2 * torch.log(sqrt_info_last[..., :3] + eps))
+    nll_rot = 0.5 * (residual_sq_last[..., 3:] * lambda_diag_last[..., 3:]
+                     - 2 * torch.log(sqrt_info_last[..., 3:] + eps))
 
     # Calibration statistics: d² = Σ λ_k r_k² (expect 3 for rot, 3 for trans)
-    d2_rot = (residual_sq_last[..., :3] * lambda_diag_last[..., :3]).sum(dim=-1)
-    d2_trans = (residual_sq_last[..., 3:] * lambda_diag_last[..., 3:]).sum(dim=-1)
+    d2_trans = (residual_sq_last[..., :3] * lambda_diag_last[..., :3]).sum(dim=-1)
+    d2_rot = (residual_sq_last[..., 3:] * lambda_diag_last[..., 3:]).sum(dim=-1)
 
     return {
         "loss_camera_nll": total_nll / n_stages,
         # For TensorBoard logging:
         "nll_rot": nll_rot.mean().detach(),
         "nll_trans": nll_trans.mean().detach(),
-        "sqrt_info_rot_mean": sqrt_info_last[..., :3].mean().detach(),
-        "sqrt_info_trans_mean": sqrt_info_last[..., 3:].mean().detach(),
+        "sqrt_info_rot_mean": sqrt_info_last[..., 3:].mean().detach(),
+        "sqrt_info_trans_mean": sqrt_info_last[..., :3].mean().detach(),
         "d2_rot_mean": d2_rot.mean().detach(),    # expect ~3 if calibrated
         "d2_trans_mean": d2_trans.mean().detach(), # expect ~3 if calibrated
         "scale_mean": scale_last.mean().detach(),
@@ -601,8 +604,9 @@ print(f"mean(d²) = {d_sq.mean():.2f} (expect ~6)")
 print(f"p95(d²) = {d_sq.quantile(0.95):.2f} (expect ~12.59)")
 
 # Separate rot/trans (each should be χ²(3)):
-d2_rot = (lambda_diag[..., :3] * residual_sq[..., :3]).sum(dim=-1)
-d2_trans = (lambda_diag[..., 3:] * residual_sq[..., 3:]).sum(dim=-1)
+# Remember: [:3] = translation, [3:] = rotation
+d2_trans = (lambda_diag[..., :3] * residual_sq[..., :3]).sum(dim=-1)
+d2_rot = (lambda_diag[..., 3:] * residual_sq[..., 3:]).sum(dim=-1)
 print(f"d²_rot mean: {d2_rot.mean():.2f} (expect ~3)")
 print(f"d²_trans mean: {d2_trans.mean():.2f} (expect ~3)")
 ```
@@ -693,7 +697,7 @@ Helps debug if translation uncertainty diverges.
 - Robust scale fitting - filter frames with GT ‖t‖ < 2cm (GT-only, not pred)
 - Scale fallback - use scale=1.0 when valid_count < 2 (all stationary)
 - `valid_mask.to(dtype)` - explicit dtype for AMP stability
-- Dimension consistency - `[..., :3]` = rot, `[..., 3:]` = trans (NEVER mix!)
+- Dimension consistency - `[..., :3]` = trans, `[..., 3:]` = rot (NEVER mix!)
 - Unit tests with REAL model output (not random!)
 - Residual sanity check - verify rot/trans magnitudes before training
 - Constant sqrt_info baseline - compare NLL/χ² against fixed sqrt_info=1

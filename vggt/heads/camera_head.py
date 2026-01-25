@@ -70,9 +70,19 @@ class CameraHead(nn.Module):
         self.adaln_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
         self.pose_branch = Mlp(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.target_dim, drop=0)
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4) -> list:
+        # Uncertainty branch: outputs 6-dim RAW values for sqrt(information matrix)
+        # Convention: 3 translation + 3 rotation (matching PyPose se(3) order)
+        # NOTE: No activation here! softplus + clamp is applied in loss for gradient smoothness
+        self.pose_uncertainty_branch = Mlp(
+            in_features=dim_in,
+            hidden_features=dim_in // 2,
+            out_features=6,  # 3 trans + 3 rot (use split_se3_tangent in loss)
+            drop=0
+        )
+
+    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4) -> tuple:
         """
-        Forward pass to predict camera parameters.
+        Forward pass to predict camera parameters and pose uncertainty.
 
         Args:
             aggregated_tokens_list (list): List of token tensors from the network;
@@ -80,7 +90,10 @@ class CameraHead(nn.Module):
             num_iterations (int, optional): Number of iterative refinement steps. Defaults to 4.
 
         Returns:
-            list: A list of predicted camera encodings (post-activation) from each iteration.
+            tuple: (pred_pose_enc_list, pred_sqrt_info_list)
+                - pred_pose_enc_list: List of predicted camera encodings (post-activation) from each iteration.
+                - pred_sqrt_info_list: List of raw uncertainty values (6-dim) from each iteration.
+                  These are RAW values; softplus + clamp is applied in loss.
         """
         # Use tokens from the last block for camera prediction.
         tokens = aggregated_tokens_list[-1]
@@ -89,23 +102,26 @@ class CameraHead(nn.Module):
         pose_tokens = tokens[:, :, 0]
         pose_tokens = self.token_norm(pose_tokens)
 
-        pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations)
-        return pred_pose_enc_list
+        pred_pose_enc_list, pred_sqrt_info_list = self.trunk_fn(pose_tokens, num_iterations)
+        return pred_pose_enc_list, pred_sqrt_info_list
 
-    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int) -> list:
+    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int) -> tuple:
         """
-        Iteratively refine camera pose predictions.
+        Iteratively refine camera pose predictions and uncertainty estimates.
 
         Args:
             pose_tokens (torch.Tensor): Normalized camera tokens with shape [B, S, C].
             num_iterations (int): Number of refinement iterations.
 
         Returns:
-            list: List of activated camera encodings from each iteration.
+            tuple: (pred_pose_enc_list, pred_sqrt_info_list)
+                - pred_pose_enc_list: List of activated camera encodings from each iteration.
+                - pred_sqrt_info_list: List of raw uncertainty values (6-dim) from each iteration.
         """
         B, S, C = pose_tokens.shape
         pred_pose_enc = None
         pred_pose_enc_list = []
+        pred_sqrt_info_list = []
 
         for _ in range(num_iterations):
             # Use a learned empty pose for the first iteration.
@@ -124,8 +140,10 @@ class CameraHead(nn.Module):
             pose_tokens_modulated = pose_tokens_modulated + pose_tokens
 
             pose_tokens_modulated = self.trunk(pose_tokens_modulated)
+            trunk_output = self.trunk_norm(pose_tokens_modulated)
+
             # Compute the delta update for the pose encoding.
-            pred_pose_enc_delta = self.pose_branch(self.trunk_norm(pose_tokens_modulated))
+            pred_pose_enc_delta = self.pose_branch(trunk_output)
 
             if pred_pose_enc is None:
                 pred_pose_enc = pred_pose_enc_delta
@@ -138,7 +156,12 @@ class CameraHead(nn.Module):
             )
             pred_pose_enc_list.append(activated_pose)
 
-        return pred_pose_enc_list
+            # Compute uncertainty (sqrt of diagonal information matrix)
+            # Output RAW values - no activation here! softplus + clamp done in loss
+            pred_sqrt_info_raw = self.pose_uncertainty_branch(trunk_output)
+            pred_sqrt_info_list.append(pred_sqrt_info_raw)
+
+        return pred_pose_enc_list, pred_sqrt_info_list
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

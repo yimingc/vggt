@@ -6,9 +6,19 @@
 
 import torch
 import torch.nn.functional as F
+import pypose as pp
 
 from dataclasses import dataclass
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding
+from vggt.utils.lie_algebra import (
+    pose_encoding_to_se3,
+    compute_window_relative_poses,
+    compute_window_scale_batched,
+    compute_se3_residual,
+    reconstruct_scaled_se3,
+    split_se3_tangent,
+    concat_se3_tangent,
+)
 from train_utils.general import check_and_fix_inf_nan
 from math import ceil, floor
 
@@ -17,17 +27,19 @@ from math import ceil, floor
 class MultitaskLoss(torch.nn.Module):
     """
     Multi-task loss module that combines different loss types for VGGT.
-    
+
     Supports:
     - Camera loss
-    - Depth loss 
+    - Camera NLL loss (for pose uncertainty)
+    - Depth loss
     - Point loss
     - Tracking loss (not cleaned yet, dirty code is at the bottom of this file)
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, **kwargs):
+    def __init__(self, camera=None, camera_nll=None, depth=None, point=None, track=None, **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
+        self.camera_nll = camera_nll  # config dict with 'weight', etc.
         self.depth = depth
         self.point = point
         self.track = track
@@ -48,10 +60,17 @@ class MultitaskLoss(torch.nn.Module):
         
         # Camera pose loss - if pose encodings are predicted
         if "pose_enc_list" in predictions:
-            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)   
-            camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]   
+            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)
+            camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]
             total_loss = total_loss + camera_loss
             loss_dict.update(camera_loss_dict)
+
+        # Camera NLL loss for uncertainty - if sqrt_info is predicted and config provided
+        if "pose_sqrt_info_list" in predictions and self.camera_nll is not None:
+            nll_loss_dict = compute_camera_nll_loss(predictions, batch, **self.camera_nll)
+            nll_loss = nll_loss_dict["loss_camera_nll"] * self.camera_nll["weight"]
+            total_loss = total_loss + nll_loss
+            loss_dict.update(nll_loss_dict)
         
         # Depth estimation loss - if depth maps are predicted
         if "depth" in predictions:
@@ -153,6 +172,177 @@ def compute_camera_loss(
         "loss_R": avg_loss_R,
         "loss_FL": avg_loss_FL
     }
+
+def compute_camera_nll_loss(
+    pred_dict,
+    batch_data,
+    pose_encoding_type="absT_quaR_FoV",
+    gamma=0.6,
+    sqrt_info_rot_clamp=(0.1, 200.0),
+    sqrt_info_trans_clamp=(0.1, 100.0),  # tighter for stability
+    residual_sq_clamp=None,  # set to e.g. 100.0 for smoke test only
+    scale_detach=True,  # detach scale to avoid cheating channel
+    min_translation=0.02,  # filter near-stationary frames (2cm)
+    eps=1e-6,  # for log stability
+    **kwargs
+):
+    """
+    NLL loss for pose uncertainty in se(3) space.
+
+    Pipeline:
+    1. Convert GT/Pred to window-relative poses (relative to frame 0)
+    2. Fit per-window scale using relative translations
+    3. Compute SE(3) residual: r = Log(inv(T_rel_gt) @ T_rel_pred)
+    4. NLL loss with diagonal information matrix
+
+    L = 0.5 * sum_i (r_i^2 * lambda_i - log(lambda_i))
+
+    Args:
+        pred_dict: predictions dict, contains 'pose_enc_list' and 'pose_sqrt_info_list'
+        batch_data: ground truth batch dict with 'extrinsics', 'intrinsics', 'images'
+        pose_encoding_type: type of pose encoding (default: "absT_quaR_FoV")
+        gamma: temporal decay weight for multi-stage training
+        sqrt_info_rot_clamp: (min, max) clamp for rotation sqrt(info)
+        sqrt_info_trans_clamp: (min, max) clamp for translation sqrt(info)
+        residual_sq_clamp: clamp for residual^2 (None to disable, for smoke test)
+        scale_detach: whether to detach scale (prevents cheating channel)
+        min_translation: threshold for filtering static frames in scale fitting
+        eps: epsilon for log stability
+
+    Returns:
+        dict with 'loss_camera_nll' and various logging metrics
+    """
+    pred_pose_encodings = pred_dict['pose_enc_list']
+    pred_sqrt_info_list = pred_dict['pose_sqrt_info_list']
+    n_stages = len(pred_pose_encodings)
+
+    # Get GT pose encoding
+    gt_extrinsics = batch_data['extrinsics']
+    gt_intrinsics = batch_data['intrinsics']
+    image_hw = batch_data['images'].shape[-2:]
+    gt_pose_enc = extri_intri_to_pose_encoding(
+        gt_extrinsics, gt_intrinsics, image_hw, pose_encoding_type
+    )  # [B, S, 9]
+
+    B, S, _ = gt_pose_enc.shape
+
+    # Step 1: Convert GT to window-relative
+    T_rel_gt = compute_window_relative_poses(gt_pose_enc)  # pp.SE3 [B, S]
+    gt_t_rel = T_rel_gt.translation()  # [B, S, 3]
+
+    total_nll = 0
+
+    # Variables to save for logging (last stage)
+    residual_sq_last = None
+    residual_sq_raw_last = None  # Before clamping, for clamped ratio
+    lambda_diag_last = None
+    sqrt_info_last = None
+    scale_last = None
+    valid_count_last = None
+
+    for stage_idx in range(n_stages):
+        stage_weight = gamma ** (n_stages - stage_idx - 1)
+        pred_pose_enc = pred_pose_encodings[stage_idx]  # [B, S, 9]
+        sqrt_info_raw = pred_sqrt_info_list[stage_idx]   # [B, S, 6]
+
+        # Step 2: Convert Pred to window-relative
+        T_rel_pred = compute_window_relative_poses(pred_pose_enc)
+        pred_t_rel = T_rel_pred.translation()  # [B, S, 3]
+
+        # Step 3: Fit per-window scale (using relative translations)
+        scale = compute_window_scale_batched(
+            pred_t_rel, gt_t_rel, detach=scale_detach, min_translation=min_translation
+        )  # [B]
+
+        # Step 4: Reconstruct scaled SE3 (keeps rotation, scales translation)
+        T_rel_pred_scaled = reconstruct_scaled_se3(T_rel_pred, scale)
+
+        # Step 5: Compute SE(3) residual: r = Log(inv(T_gt) @ T_pred)
+        residual = compute_se3_residual(T_rel_pred_scaled, T_rel_gt)  # [B, S, 6]
+        # DIMENSION CONVENTION (PyPose Log output):
+        #   residual[..., :3] = translation (vx, vy, vz) in meters
+        #   residual[..., 3:] = rotation (wx, wy, wz) in radians
+
+        # Step 6: Skip frame 0 (identity, residual=0)
+        residual = residual[:, 1:]          # [B, S-1, 6]
+        sqrt_info_frame = sqrt_info_raw[:, 1:]  # [B, S-1, 6]
+
+        # Step 7: SOFTPLUS + CLAMP for stable positive sqrt_info
+        # softplus ensures positive, clamp is just safety rail
+        sqrt_info_positive = F.softplus(sqrt_info_frame) + eps  # Always positive!
+
+        # Split into translation and rotation components using convention function
+        sqrt_info_trans, sqrt_info_rot = split_se3_tangent(sqrt_info_positive)
+        sqrt_info_trans = sqrt_info_trans.clamp(
+            min=sqrt_info_trans_clamp[0], max=sqrt_info_trans_clamp[1]
+        )
+        sqrt_info_rot = sqrt_info_rot.clamp(
+            min=sqrt_info_rot_clamp[0], max=sqrt_info_rot_clamp[1]
+        )
+        sqrt_info_clamped = concat_se3_tangent(sqrt_info_trans, sqrt_info_rot)
+
+        # Step 8: NLL loss
+        residual_sq_raw = residual ** 2
+        if residual_sq_clamp is not None:
+            residual_sq = residual_sq_raw.clamp(max=residual_sq_clamp)  # Only for smoke test
+        else:
+            residual_sq = residual_sq_raw
+        lambda_diag = sqrt_info_clamped ** 2
+        nll = 0.5 * (residual_sq * lambda_diag - 2 * torch.log(sqrt_info_clamped + eps))
+
+        total_nll += stage_weight * nll.mean()
+
+        # Save for logging (last stage only)
+        if stage_idx == n_stages - 1:
+            residual_sq_last = residual_sq
+            residual_sq_raw_last = residual_sq_raw
+            lambda_diag_last = lambda_diag
+            sqrt_info_last = sqrt_info_clamped
+            scale_last = scale
+            # Compute valid_count for scale fitting health
+            gt_t = gt_t_rel[:, 1:]
+            gt_norm = gt_t.norm(dim=-1)
+            valid_mask = gt_norm > min_translation
+            valid_count_last = valid_mask.sum(dim=-1).float()
+
+    # Compute separate rot/trans NLL for logging (last stage only)
+    # Split using convention function for consistency
+    rsq_trans, rsq_rot = split_se3_tangent(residual_sq_last)
+    lam_trans, lam_rot = split_se3_tangent(lambda_diag_last)
+    si_trans, si_rot = split_se3_tangent(sqrt_info_last)
+
+    nll_trans = 0.5 * (rsq_trans * lam_trans - 2 * torch.log(si_trans + eps))
+    nll_rot = 0.5 * (rsq_rot * lam_rot - 2 * torch.log(si_rot + eps))
+
+    # Calibration statistics: d^2 = sum_k lambda_k r_k^2 (expect 3 for rot, 3 for trans)
+    d2_trans = (rsq_trans * lam_trans).sum(dim=-1)  # [B, S-1]
+    d2_rot = (rsq_rot * lam_rot).sum(dim=-1)        # [B, S-1]
+
+    # Compute residual_sq clamped ratio (fraction of values that hit the clamp)
+    # This detects if clamping is distorting the loss signal
+    if residual_sq_clamp is not None:
+        clamped_mask = residual_sq_raw_last >= residual_sq_clamp
+        residual_sq_clamped_ratio = clamped_mask.float().mean().detach()
+    else:
+        residual_sq_clamped_ratio = torch.tensor(0.0, device=residual_sq_last.device)
+
+    return {
+        "loss_camera_nll": total_nll / n_stages,
+        # For TensorBoard logging:
+        "nll_rot": nll_rot.mean().detach(),
+        "nll_trans": nll_trans.mean().detach(),
+        "sqrt_info_rot_mean": si_rot.mean().detach(),
+        "sqrt_info_trans_mean": si_trans.mean().detach(),
+        "d2_rot_mean": d2_rot.mean().detach(),    # expect ~3 if calibrated
+        "d2_trans_mean": d2_trans.mean().detach(), # expect ~3 if calibrated
+        # Scale fitting health metrics
+        "scale_mean": scale_last.mean().detach(),
+        "scale_std": scale_last.std().detach(),
+        "scale_valid_count_mean": valid_count_last.mean().detach(),
+        # Clamp ratio (should be < 0.1 for smoke test, 0 for production)
+        "residual_sq_clamped_ratio": residual_sq_clamped_ratio,
+    }
+
 
 def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     """
