@@ -212,18 +212,43 @@ def run_smoke_test(args):
             'd2_trans_mean': loss_dict['d2_trans_mean'].item(),
             'scale_mean': loss_dict['scale_mean'].item(),
             'scale_std': loss_dict['scale_std'].item(),
+            'scale_valid_count': loss_dict['scale_valid_count_mean'].item(),
             'residual_sq_clamped_ratio': loss_dict['residual_sq_clamped_ratio'].item(),
             'grad_norm': grad_norm,
             'has_nan': has_nan,
+            # Debug: scale investigation
+            'gt_trans_norm_mean': loss_dict['gt_trans_norm_mean'].item(),
+            'pred_trans_norm_mean': loss_dict['pred_trans_norm_mean'].item(),
+            'scale_at_min_ratio': loss_dict['scale_at_min_ratio'].item(),
+            'scale_at_max_ratio': loss_dict['scale_at_max_ratio'].item(),
+            # Debug: dot product analysis
+            'scale_numerator': loss_dict['scale_numerator'].item(),
+            'scale_denominator': loss_dict['scale_denominator'].item(),
+            'scale_raw': loss_dict['scale_raw'].item(),
         }
         metrics_history.append(metrics)
 
         # Log every log_interval iterations
         if (iteration + 1) % args.log_interval == 0 or iteration == 0:
+            scale_val = metrics['scale_mean']
+            scale_flag = ""
+            if scale_val <= 0.011:
+                scale_flag = " [AT MIN!]"
+            elif scale_val >= 99.9:
+                scale_flag = " [AT MAX!]"
             print(f"Iter {iteration+1:3d} | loss: {loss_val:.4f} | "
                   f"nll_rot: {metrics['nll_rot']:.3f} | nll_trans: {metrics['nll_trans']:.3f} | "
                   f"d²_rot: {metrics['d2_rot_mean']:.2f} | d²_trans: {metrics['d2_trans_mean']:.2f} | "
-                  f"scale: {metrics['scale_mean']:.3f} | grad: {grad_norm:.4f}")
+                  f"scale: {scale_val:.3f}{scale_flag} | grad: {grad_norm:.4f}")
+            # Print debug info when scale is at extreme
+            if scale_flag:
+                print(f"        DEBUG: gt_norm={metrics['gt_trans_norm_mean']:.4f}m, "
+                      f"pred_norm={metrics['pred_trans_norm_mean']:.4f}m, "
+                      f"valid_count={metrics['scale_valid_count']:.1f}")
+                print(f"        DEBUG: numerator={metrics['scale_numerator']:.6f}, "
+                      f"denominator={metrics['scale_denominator']:.6f}, "
+                      f"scale_raw={metrics['scale_raw']:.4f} "
+                      f"({'NEGATIVE!' if metrics['scale_raw'] < 0 else 'positive'})")
 
     # Evaluate results
     print("\n" + "="*60)

@@ -18,6 +18,7 @@ from vggt.utils.lie_algebra import (
     reconstruct_scaled_se3,
     split_se3_tangent,
     concat_se3_tangent,
+    extract_camera_positions,
 )
 from train_utils.general import check_and_fix_inf_nan
 from math import ceil, floor
@@ -228,7 +229,9 @@ def compute_camera_nll_loss(
 
     # Step 1: Convert GT to window-relative
     T_rel_gt = compute_window_relative_poses(gt_pose_enc)  # pp.SE3 [B, S]
-    gt_t_rel = T_rel_gt.translation()  # [B, S, 3]
+    # Use camera positions (C = -R^T @ t) for scale fitting, not raw translations
+    # This correctly represents camera motion direction in the reference frame
+    gt_cam_pos_rel = extract_camera_positions(T_rel_gt)  # [B, S, 3]
 
     total_nll = 0
 
@@ -247,11 +250,12 @@ def compute_camera_nll_loss(
 
         # Step 2: Convert Pred to window-relative
         T_rel_pred = compute_window_relative_poses(pred_pose_enc)
-        pred_t_rel = T_rel_pred.translation()  # [B, S, 3]
+        # Use camera positions for scale fitting
+        pred_cam_pos_rel = extract_camera_positions(T_rel_pred)  # [B, S, 3]
 
-        # Step 3: Fit per-window scale (using relative translations)
+        # Step 3: Fit per-window scale (using camera positions, not raw translations)
         scale = compute_window_scale_batched(
-            pred_t_rel, gt_t_rel, detach=scale_detach, min_translation=min_translation
+            pred_cam_pos_rel, gt_cam_pos_rel, detach=scale_detach, min_translation=min_translation
         )  # [B]
 
         # Step 4: Reconstruct scaled SE3 (keeps rotation, scales translation)
@@ -300,10 +304,23 @@ def compute_camera_nll_loss(
             sqrt_info_last = sqrt_info_clamped
             scale_last = scale
             # Compute valid_count for scale fitting health
-            gt_t = gt_t_rel[:, 1:]
-            gt_norm = gt_t.norm(dim=-1)
+            # Use camera positions (same as scale fitting)
+            gt_pos = gt_cam_pos_rel[:, 1:]
+            pred_pos = pred_cam_pos_rel[:, 1:]
+            gt_norm = gt_pos.norm(dim=-1)
+            pred_norm = pred_pos.norm(dim=-1)
             valid_mask = gt_norm > min_translation
             valid_count_last = valid_mask.sum(dim=-1).float()
+            # Debug metrics for scale investigation
+            gt_trans_norm_last = gt_norm  # [B, S-1]
+            pred_trans_norm_last = pred_norm  # [B, S-1]
+            # Debug: dot product for direction analysis
+            dot_product = (gt_pos * pred_pos).sum(dim=-1)  # [B, S-1]
+            pred_sq = (pred_pos ** 2).sum(dim=-1)          # [B, S-1]
+            m = valid_mask.to(dot_product.dtype)
+            scale_numerator_last = (dot_product * m).sum(dim=-1)  # [B]
+            scale_denominator_last = (pred_sq * m).sum(dim=-1)    # [B]
+            scale_raw_last = scale_numerator_last / scale_denominator_last.clamp(min=1e-8)  # [B]
 
     # Compute separate rot/trans NLL for logging (last stage only)
     # Split using convention function for consistency
@@ -326,6 +343,10 @@ def compute_camera_nll_loss(
     else:
         residual_sq_clamped_ratio = torch.tensor(0.0, device=residual_sq_last.device)
 
+    # Scale at clamp ratio (debug)
+    scale_at_min = (scale_last <= 0.01 + 1e-6).float().mean().detach()
+    scale_at_max = (scale_last >= 100.0 - 1e-6).float().mean().detach()
+
     return {
         "loss_camera_nll": total_nll / n_stages,
         # For TensorBoard logging:
@@ -341,6 +362,15 @@ def compute_camera_nll_loss(
         "scale_valid_count_mean": valid_count_last.mean().detach(),
         # Clamp ratio (should be < 0.1 for smoke test, 0 for production)
         "residual_sq_clamped_ratio": residual_sq_clamped_ratio,
+        # Debug: scale investigation
+        "gt_trans_norm_mean": gt_trans_norm_last.mean().detach(),
+        "pred_trans_norm_mean": pred_trans_norm_last.mean().detach(),
+        "scale_at_min_ratio": scale_at_min,
+        "scale_at_max_ratio": scale_at_max,
+        # Debug: dot product analysis (direction mismatch)
+        "scale_numerator": scale_numerator_last.mean().detach(),  # negative = opposite direction
+        "scale_denominator": scale_denominator_last.mean().detach(),
+        "scale_raw": scale_raw_last.mean().detach(),  # before clamping
     }
 
 

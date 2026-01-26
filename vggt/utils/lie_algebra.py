@@ -87,6 +87,29 @@ def pose_encoding_to_se3(pose_enc: torch.Tensor) -> pp.SE3:
     return pp.SE3(se3_vec)
 
 
+def extract_camera_positions(T: pp.SE3) -> torch.Tensor:
+    """
+    Extract camera positions from SE3 poses.
+
+    For world-to-camera transformation T = [R|t]:
+        Camera position in world = -R^T @ t
+
+    For relative transformation T_rel (frame_i relative to frame_0):
+        This gives camera_i's position in frame_0's coordinate system.
+
+    Args:
+        T: pp.SE3 of shape [B, S]
+
+    Returns:
+        positions: [B, S, 3] camera positions
+    """
+    R = T.rotation().matrix()  # [B, S, 3, 3]
+    t = T.translation()        # [B, S, 3]
+    # Camera position = -R^T @ t
+    positions = -torch.einsum('...ij,...j->...i', R.transpose(-1, -2), t)
+    return positions
+
+
 def compute_window_relative_poses(pose_enc: torch.Tensor) -> pp.SE3:
     """
     Convert absolute poses to window-relative (relative to frame 0).
@@ -151,7 +174,14 @@ def compute_window_scale_batched(
     # Count valid frames per batch
     valid_count = valid_mask.sum(dim=-1)  # [B]
 
-    scale = numerator / denominator.clamp(min=1e-8)
+    scale_raw = numerator / denominator.clamp(min=1e-8)
+
+    # FALLBACK for negative scale: If dot product is negative, GT and Pred motion
+    # directions are fundamentally misaligned (possibly due to coordinate system
+    # differences or prediction errors). Scale fitting doesn't make sense in this
+    # case, so fall back to scale=1.0.
+    # NOTE: This can happen when VGGT predictions have rotational offset from GT.
+    scale = torch.where(scale_raw > 0, scale_raw, torch.ones_like(scale_raw))
     scale = scale.clamp(min=0.01, max=100.0)
 
     # FALLBACK: Require at least 2 valid motion frames for robust scale estimation.

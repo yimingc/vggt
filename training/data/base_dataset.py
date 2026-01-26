@@ -297,7 +297,9 @@ class BaseDataset(Dataset):
             replace=True,   # we accept the situation that some sampled ids are the same
         )
 
-        # Insert the start_idx at the beginning
-        result_ids = np.insert(sampled_ids, 0, start_idx)
+        # Include start_idx and sort to maintain temporal order
+        # This is critical for window-relative pose computation where
+        # frame 0 is the reference - all other frames should be forward in time
+        result_ids = np.sort(np.append(sampled_ids, start_idx))
 
         return result_ids
