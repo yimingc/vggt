@@ -8,7 +8,6 @@ This document outlines the test plan for verifying the pose uncertainty head imp
 
 ## Table of Contents
 
-- [Dimension Convention (CRITICAL)](#dimension-convention-critical)
 - [Phase 1: Pre-Training Verification](#phase-1-pre-training-verification-already-done)
 - [Phase 2: Training Smoke Test](#phase-2-training-smoke-test)
   - [2.1 Setup](#21-setup)
@@ -37,33 +36,6 @@ This document outlines the test plan for verifying the pose uncertainty head imp
   - [6.3 Expected Training Time](#63-expected-training-time)
   - [6.4 Scaling Checklist](#64-scaling-checklist)
   - [6.5 Cross-Sequence Validation](#65-cross-sequence-validation)
-
----
-
-## Dimension Convention (CRITICAL)
-
-PyPose `SE3.Log()` returns `[vx, vy, vz, wx, wy, wz]` — **translation first, rotation second**.
-
-**Freeze this contract in code using split/concat functions:**
-
-```python
-# In vggt/utils/lie_algebra.py
-def split_se3_tangent(xi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split se(3) tangent vector into translation (v) and rotation (w)."""
-    v = xi[..., :3]  # translation [vx, vy, vz] in meters
-    w = xi[..., 3:]  # rotation [wx, wy, wz] in radians
-    return v, w
-
-def concat_se3_tangent(v: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """Concatenate translation and rotation into se(3) tangent vector."""
-    return torch.cat([v, w], dim=-1)
-
-# Usage everywhere:
-v, w = split_se3_tangent(residual)  # v=translation, w=rotation
-sqrt_info_trans, sqrt_info_rot = split_se3_tangent(sqrt_info)
-```
-
-**Use these functions consistently** in loss computation, logging, plotting, and evaluation.
 
 ---
 
