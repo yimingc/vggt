@@ -173,8 +173,8 @@ def run_smoke_test(args):
                 batch_data,
                 pose_encoding_type="absT_quaR_FoV",
                 gamma=0.6,
-                sqrt_info_rot_clamp=(0.1, 200.0),
-                sqrt_info_trans_clamp=(0.1, 100.0),
+                sqrt_info_rot_inv_rad_clamp=(0.1, 200.0),
+                sqrt_info_trans_inv_meter_clamp=(0.1, 100.0),
                 residual_sq_clamp=100.0,  # Safety for smoke test
                 scale_detach=True,
                 min_translation=0.02,
@@ -206,8 +206,8 @@ def run_smoke_test(args):
             'loss': loss_val,
             'nll_rot': loss_dict['nll_rot'].item(),
             'nll_trans': loss_dict['nll_trans'].item(),
-            'sqrt_info_rot_mean': loss_dict['sqrt_info_rot_mean'].item(),
-            'sqrt_info_trans_mean': loss_dict['sqrt_info_trans_mean'].item(),
+            'sqrt_info_rot_inv_rad_mean': loss_dict['sqrt_info_rot_inv_rad_mean'].item(),
+            'sqrt_info_trans_inv_meter_mean': loss_dict['sqrt_info_trans_inv_meter_mean'].item(),
             'd2_rot_mean': loss_dict['d2_rot_mean'].item(),
             'd2_trans_mean': loss_dict['d2_trans_mean'].item(),
             'scale_mean': loss_dict['scale_mean'].item(),
@@ -248,13 +248,13 @@ def run_smoke_test(args):
         success = False
 
     # Check 3: sqrt_info not stuck at clamps
-    final_sqrt_info_rot = metrics_history[-1]['sqrt_info_rot_mean']
-    final_sqrt_info_trans = metrics_history[-1]['sqrt_info_trans_mean']
+    final_sqrt_info_rot = metrics_history[-1]['sqrt_info_rot_inv_rad_mean']
+    final_sqrt_info_trans = metrics_history[-1]['sqrt_info_trans_inv_meter_mean']
     rot_at_clamp = final_sqrt_info_rot <= 0.11 or final_sqrt_info_rot >= 199
     trans_at_clamp = final_sqrt_info_trans <= 0.11 or final_sqrt_info_trans >= 99
-    print(f"✓ sqrt_info_rot: {final_sqrt_info_rot:.2f} "
+    print(f"✓ sqrt_info_rot_inv_rad: {final_sqrt_info_rot:.2f} "
           f"({'at clamp ✗' if rot_at_clamp else 'OK ✓'})")
-    print(f"✓ sqrt_info_trans: {final_sqrt_info_trans:.2f} "
+    print(f"✓ sqrt_info_trans_inv_meter: {final_sqrt_info_trans:.2f} "
           f"({'at clamp ✗' if trans_at_clamp else 'OK ✓'})")
 
     # Check 4: Scale stable

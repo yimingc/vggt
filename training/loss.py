@@ -178,8 +178,8 @@ def compute_camera_nll_loss(
     batch_data,
     pose_encoding_type="absT_quaR_FoV",
     gamma=0.6,
-    sqrt_info_rot_clamp=(0.1, 200.0),
-    sqrt_info_trans_clamp=(0.1, 100.0),  # tighter for stability
+    sqrt_info_rot_inv_rad_clamp=(0.1, 200.0),
+    sqrt_info_trans_inv_meter_clamp=(0.1, 100.0),  # tighter for stability
     residual_sq_clamp=None,  # set to e.g. 100.0 for smoke test only
     scale_detach=True,  # detach scale to avoid cheating channel
     min_translation=0.02,  # filter near-stationary frames (2cm)
@@ -202,8 +202,8 @@ def compute_camera_nll_loss(
         batch_data: ground truth batch dict with 'extrinsics', 'intrinsics', 'images'
         pose_encoding_type: type of pose encoding (default: "absT_quaR_FoV")
         gamma: temporal decay weight for multi-stage training
-        sqrt_info_rot_clamp: (min, max) clamp for rotation sqrt(info)
-        sqrt_info_trans_clamp: (min, max) clamp for translation sqrt(info)
+        sqrt_info_rot_inv_rad_clamp: (min, max) clamp for rotation sqrt(info) [rad⁻¹]
+        sqrt_info_trans_inv_meter_clamp: (min, max) clamp for translation sqrt(info) [m⁻¹]
         residual_sq_clamp: clamp for residual^2 (None to disable, for smoke test)
         scale_detach: whether to detach scale (prevents cheating channel)
         min_translation: threshold for filtering static frames in scale fitting
@@ -272,14 +272,14 @@ def compute_camera_nll_loss(
         sqrt_info_positive = F.softplus(sqrt_info_frame) + eps  # Always positive!
 
         # Split into translation and rotation components using convention function
-        sqrt_info_trans, sqrt_info_rot = split_se3_tangent(sqrt_info_positive)
-        sqrt_info_trans = sqrt_info_trans.clamp(
-            min=sqrt_info_trans_clamp[0], max=sqrt_info_trans_clamp[1]
+        sqrt_info_trans_inv_meter, sqrt_info_rot_inv_rad = split_se3_tangent(sqrt_info_positive)
+        sqrt_info_trans_inv_meter = sqrt_info_trans_inv_meter.clamp(
+            min=sqrt_info_trans_inv_meter_clamp[0], max=sqrt_info_trans_inv_meter_clamp[1]
         )
-        sqrt_info_rot = sqrt_info_rot.clamp(
-            min=sqrt_info_rot_clamp[0], max=sqrt_info_rot_clamp[1]
+        sqrt_info_rot_inv_rad = sqrt_info_rot_inv_rad.clamp(
+            min=sqrt_info_rot_inv_rad_clamp[0], max=sqrt_info_rot_inv_rad_clamp[1]
         )
-        sqrt_info_clamped = concat_se3_tangent(sqrt_info_trans, sqrt_info_rot)
+        sqrt_info_clamped = concat_se3_tangent(sqrt_info_trans_inv_meter, sqrt_info_rot_inv_rad)
 
         # Step 8: NLL loss
         residual_sq_raw = residual ** 2
@@ -331,8 +331,8 @@ def compute_camera_nll_loss(
         # For TensorBoard logging:
         "nll_rot": nll_rot.mean().detach(),
         "nll_trans": nll_trans.mean().detach(),
-        "sqrt_info_rot_mean": si_rot.mean().detach(),
-        "sqrt_info_trans_mean": si_trans.mean().detach(),
+        "sqrt_info_rot_inv_rad_mean": si_rot.mean().detach(),
+        "sqrt_info_trans_inv_meter_mean": si_trans.mean().detach(),
         "d2_rot_mean": d2_rot.mean().detach(),    # expect ~3 if calibrated
         "d2_trans_mean": d2_trans.mean().detach(), # expect ~3 if calibrated
         # Scale fitting health metrics
