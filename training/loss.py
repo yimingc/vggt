@@ -337,7 +337,7 @@ def compute_camera_nll_loss(
         "d2_trans_mean": d2_trans.mean().detach(), # expect ~3 if calibrated
         # Scale fitting health metrics
         "scale_mean": scale_last.mean().detach(),
-        "scale_std": scale_last.std().detach(),
+        "scale_std": scale_last.std().detach() if scale_last.numel() > 1 else torch.tensor(0.0),
         "scale_valid_count_mean": valid_count_last.mean().detach(),
         # Clamp ratio (should be < 0.1 for smoke test, 0 for production)
         "residual_sq_clamped_ratio": residual_sq_clamped_ratio,
