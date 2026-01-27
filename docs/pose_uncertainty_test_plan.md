@@ -9,7 +9,7 @@ This document outlines the test plan for verifying the pose uncertainty head imp
 ## Table of Contents
 
 - [Phase 1: Pre-Training Verification](#phase-1-pre-training-verification-already-done)
-- [Phase 2: Training Smoke Test](#phase-2-training-smoke-test)
+- [Phase 2: Training Smoke Test (Complete)](#phase-2-training-smoke-test-complete)
   - [2.1 Setup](#21-setup)
   - [2.2 Training Script Modifications](#22-training-script-modifications)
   - [2.3 Smoke Test Command](#23-smoke-test-command)
@@ -39,7 +39,7 @@ This document outlines the test plan for verifying the pose uncertainty head imp
 
 ---
 
-## Phase 1: Pre-Training Verification (Already Done)
+## Phase 1: Pre-Training Verification (Complete)
 
 Run unit tests to verify conventions:
 
@@ -59,7 +59,7 @@ python -m pytest training/tests/test_lie_algebra.py -v
 
 ---
 
-## Phase 2: Training Smoke Test
+## Phase 2: Training Smoke Test (Complete)
 
 ### 2.1 Setup
 
@@ -130,11 +130,18 @@ python training/train.py \
 ### 2.4 Success Criteria
 
 After 100 iterations:
-- [ ] `loss_camera_nll` decreases (not necessarily monotonic, but trending down)
-- [ ] No NaN/Inf in loss or gradients
-- [ ] `sqrt_info_rot_mean` and `sqrt_info_trans_mean` not stuck at clamp boundaries
-- [ ] `scale_mean` stable across batches (not collapsing to 0.01 or 100)
-- [ ] `residual_sq_clamped_ratio` < 10% (if higher, loss signal is misleading)
+- [x] `loss_camera_nll` decreases (not necessarily monotonic, but trending down)
+- [x] No NaN/Inf in loss or gradients
+- [x] `sqrt_info_rot_mean` and `sqrt_info_trans_mean` not stuck at clamp boundaries
+- [x] `scale_mean` stable across batches (not collapsing to 0.01 or 100)
+- [x] `residual_sq_clamped_ratio` < 10% (if higher, loss signal is misleading)
+
+**Results (2026-01-27):**
+- Loss: -0.50 → -1.34 (decreasing ✓)
+- sqrt_info_rot: 20.76, sqrt_info_trans: 20.21 (not at clamps ✓)
+- scale: 0.628 (stable ✓)
+- residual_sq_clamped_ratio: 0.0% (< 10% ✓)
+- d²_rot: 0.07, d²_trans: 0.03 (low, calibration evaluated in Phase 4)
 
 ---
 
@@ -529,20 +536,20 @@ def test_static_sequence_handling(model, device):
 
 ## Quick Test Checklist
 
-### Before Training
-- [ ] Unit tests pass: `python -m pytest training/tests/test_lie_algebra.py -v`
-- [ ] Model loads with uncertainty head
-- [ ] Forward pass produces `pose_sqrt_info_list`
-- [ ] Only uncertainty branch requires grad (verify_trainable_params)
-- [ ] Dimension convention frozen in code (split_se3_tangent, concat_se3_tangent)
+### Before Training (Phase 1 - Complete)
+- [x] Unit tests pass: `python -m pytest training/tests/test_lie_algebra.py -v`
+- [x] Model loads with uncertainty head
+- [x] Forward pass produces `pose_sqrt_info_list`
+- [x] Only uncertainty branch requires grad (verify_trainable_params)
+- [x] Dimension convention frozen in code (split_se3_tangent, concat_se3_tangent)
 
-### During Training (First 100 iters)
-- [ ] Loss decreases
-- [ ] No NaN/Inf
-- [ ] sqrt_info not stuck at clamps
-- [ ] Scale fitting healthy (scale_mean stable, not at extremes)
-- [ ] Gradient norm non-zero for uncertainty head
-- [ ] residual_sq_clamped_ratio < 10%
+### During Training (First 100 iters) (Phase 2 - Complete)
+- [x] Loss decreases
+- [x] No NaN/Inf
+- [x] sqrt_info not stuck at clamps
+- [x] Scale fitting healthy (scale_mean stable, not at extremes)
+- [x] Gradient norm non-zero for uncertainty head
+- [x] residual_sq_clamped_ratio < 10%
 
 ### After Training
 - [ ] Trained NLL < baseline NLL (constant sqrt_info=1)
@@ -559,7 +566,7 @@ def test_static_sequence_handling(model, device):
 | Phase | Duration | Description |
 |-------|----------|-------------|
 | Phase 1 | Done | Unit tests already passing |
-| Phase 2 | 10 min | 100-iter smoke test |
+| Phase 2 | Done | 100-iter smoke test passed |
 | Phase 3 | Ongoing | Monitor during training |
 | Phase 4 | 10 min | Calibration check + baseline comparison |
 | Phase 5 | 10 min | Integration with existing eval |
