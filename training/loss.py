@@ -12,13 +12,13 @@ from dataclasses import dataclass
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding
 from vggt.utils.lie_algebra import (
     pose_encoding_to_se3,
-    compute_window_relative_poses,
+    extract_window_relative_poses,
     compute_window_scale_batched,
     compute_se3_residual,
     reconstruct_scaled_se3,
     split_se3_tangent,
     concat_se3_tangent,
-    extract_camera_positions,
+    extract_relative_camera_positions,
 )
 from train_utils.general import check_and_fix_inf_nan
 from math import ceil, floor
@@ -227,11 +227,13 @@ def compute_camera_nll_loss(
 
     B, S, _ = gt_pose_enc.shape
 
-    # Step 1: Convert GT to window-relative
-    T_rel_gt = compute_window_relative_poses(gt_pose_enc)  # pp.SE3 [B, S]
-    # Use camera positions (C = -R^T @ t) for scale fitting, not raw translations
-    # This correctly represents camera motion direction in the reference frame
-    gt_cam_pos_rel = extract_camera_positions(T_rel_gt)  # [B, S, 3]
+    # Step 1: Convert GT to SE3 and compute window-relative poses
+    T_cam_world_gt = pose_encoding_to_se3(gt_pose_enc)  # pp.SE3 [B, S]
+    T_cam0_cami_gt = extract_window_relative_poses(T_cam_world_gt)  # pp.SE3 [B, S]
+
+    # Extract relative camera positions for scale fitting
+    # IMPORTANT: Use extract_relative_camera_positions on T_cam_world, NOT on T_cam0_cami!
+    gt_cam_pos_rel = extract_relative_camera_positions(T_cam_world_gt)  # [B, S, 3]
 
     total_nll = 0
 
@@ -248,21 +250,23 @@ def compute_camera_nll_loss(
         pred_pose_enc = pred_pose_encodings[stage_idx]  # [B, S, 9]
         sqrt_info_raw = pred_sqrt_info_list[stage_idx]   # [B, S, 6]
 
-        # Step 2: Convert Pred to window-relative
-        T_rel_pred = compute_window_relative_poses(pred_pose_enc)
-        # Use camera positions for scale fitting
-        pred_cam_pos_rel = extract_camera_positions(T_rel_pred)  # [B, S, 3]
+        # Step 2: Convert Pred to SE3 and compute window-relative poses
+        T_cam_world_pred = pose_encoding_to_se3(pred_pose_enc)  # pp.SE3 [B, S]
+        T_cam0_cami_pred = extract_window_relative_poses(T_cam_world_pred)
+        # Extract relative camera positions for scale fitting
+        # IMPORTANT: Use extract_relative_camera_positions on T_cam_world, NOT on T_cam0_cami!
+        pred_cam_pos_rel = extract_relative_camera_positions(T_cam_world_pred)  # [B, S, 3]
 
-        # Step 3: Fit per-window scale (using camera positions, not raw translations)
+        # Step 3: Fit per-window scale (using camera positions)
         scale = compute_window_scale_batched(
             pred_cam_pos_rel, gt_cam_pos_rel, detach=scale_detach, min_translation=min_translation
         )  # [B]
 
         # Step 4: Reconstruct scaled SE3 (keeps rotation, scales translation)
-        T_rel_pred_scaled = reconstruct_scaled_se3(T_rel_pred, scale)
+        T_cam0_cami_pred_scaled = reconstruct_scaled_se3(T_cam0_cami_pred, scale)
 
-        # Step 5: Compute SE(3) residual: r = Log(inv(T_gt) @ T_pred)
-        residual = compute_se3_residual(T_rel_pred_scaled, T_rel_gt)  # [B, S, 6]
+        # Step 5: Compute SE(3) residual: r = Log(T_gt.Inv() @ T_pred)
+        residual = compute_se3_residual(T_cam0_cami_pred_scaled, T_cam0_cami_gt)  # [B, S, 6]
         # DIMENSION CONVENTION (PyPose Log output):
         #   residual[..., :3] = translation (vx, vy, vz) in meters
         #   residual[..., 3:] = rotation (wx, wy, wz) in radians

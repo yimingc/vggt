@@ -18,7 +18,7 @@ import numpy as np
 
 from vggt.utils.lie_algebra import (
     pose_encoding_to_se3,
-    compute_window_relative_poses,
+    extract_window_relative_poses,
     compute_window_scale_batched,
     compute_se3_residual,
     reconstruct_scaled_se3,
@@ -214,7 +214,8 @@ class TestWindowRelativePoses:
         fov = torch.ones(B, S, 2)
         pose_enc = torch.cat([t, q, fov], dim=-1)
 
-        T_rel = compute_window_relative_poses(pose_enc)
+        T_abs = pose_encoding_to_se3(pose_enc)
+        T_rel = extract_window_relative_poses(T_abs)
 
         # Frame 0 should be identity
         T_rel_0 = T_rel[:, 0]  # [B]
@@ -226,7 +227,7 @@ class TestWindowRelativePoses:
         print("Window-relative frame 0 is identity")
 
     def test_window_relative_consistency(self):
-        """Verify T_rel_i = T_0^{-1} @ T_i manually."""
+        """Verify T_cam0_cami = T_cam_world[0] @ T_cam_world[i].Inv() manually."""
         torch.manual_seed(42)
         B, S = 2, 4
 
@@ -236,15 +237,14 @@ class TestWindowRelativePoses:
         fov = torch.ones(B, S, 2)
         pose_enc = torch.cat([t, q, fov], dim=-1)
 
-        T_rel = compute_window_relative_poses(pose_enc)
+        # Manual computation: T_cam0_cami = T_cam_world[0] @ T_cam_world[i].Inv()
+        T_cam_world = pose_encoding_to_se3(pose_enc)
+        T_cam0_cami = extract_window_relative_poses(T_cam_world)
+        T_0 = T_cam_world[:, 0:1]
+        T_cam0_cami_manual = T_0 @ T_cam_world.Inv()
 
-        # Manual computation
-        T_abs = pose_encoding_to_se3(pose_enc)
-        T_0 = T_abs[:, 0:1]
-        T_rel_manual = T_0.Inv() @ T_abs
-
-        assert torch.allclose(T_rel.matrix(), T_rel_manual.matrix(), atol=1e-5), \
-            f"Window relative mismatch! Max diff: {(T_rel.matrix() - T_rel_manual.matrix()).abs().max()}"
+        assert torch.allclose(T_cam0_cami.matrix(), T_cam0_cami_manual.matrix(), atol=1e-5), \
+            f"Window relative mismatch! Max diff: {(T_cam0_cami.matrix() - T_cam0_cami_manual.matrix()).abs().max()}"
 
         print("Window-relative computation verified")
 
@@ -322,7 +322,8 @@ class TestSE3Residual:
         fov = torch.ones(B, S, 2)
         pose_enc = torch.cat([t, q, fov], dim=-1)
 
-        T_rel = compute_window_relative_poses(pose_enc)
+        T_abs = pose_encoding_to_se3(pose_enc)
+        T_rel = extract_window_relative_poses(T_abs)
 
         residual = compute_se3_residual(T_rel, T_rel)
 
@@ -439,8 +440,10 @@ class TestResidualSanityCheck:
         pred_pose_enc = torch.cat([t_pred, q_pred, fov], dim=-1)
 
         # Compute window-relative
-        T_rel_gt = compute_window_relative_poses(gt_pose_enc)
-        T_rel_pred = compute_window_relative_poses(pred_pose_enc)
+        T_abs_gt = pose_encoding_to_se3(gt_pose_enc)
+        T_abs_pred = pose_encoding_to_se3(pred_pose_enc)
+        T_rel_gt = extract_window_relative_poses(T_abs_gt)
+        T_rel_pred = extract_window_relative_poses(T_abs_pred)
 
         # Scale fitting
         gt_t_rel = T_rel_gt.translation()

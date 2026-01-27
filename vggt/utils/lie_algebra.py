@@ -13,13 +13,19 @@ This module provides utilities for:
 - Fitting per-window scale using relative translations
 - Computing SE(3) residuals for NLL loss
 
+Shape Convention:
+    B = batch size (number of windows)
+    S = sequence length (number of frames per window)
+
+Frame Naming Convention (T_A_B = transform from frame B to frame A):
+    T_cam_world  = world-to-camera transform (absolute pose)
+    T_cam0_cami  = camera_i to camera_0 transform (relative pose)
+
 Dimension Convention (IMPORTANT!):
     PyPose SE3.Log() returns 6-dim vector: [vx, vy, vz, wx, wy, wz]
                                            |--- :3 ---|  |--- 3: ---|
                                            translation   rotation
                                            (meters)      (radians)
-
-    Use TRANS_SLICE and ROT_SLICE constants to avoid hardcoding indices.
 """
 
 import torch
@@ -87,48 +93,38 @@ def pose_encoding_to_se3(pose_enc: torch.Tensor) -> pp.SE3:
     return pp.SE3(se3_vec)
 
 
-def extract_camera_positions(T: pp.SE3) -> torch.Tensor:
+def extract_relative_camera_positions(T_cam_world: pp.SE3) -> torch.Tensor:
     """
-    Extract camera positions from SE3 poses.
+    Extract camera positions relative to frame 0.
 
-    For world-to-camera transformation T = [R|t]:
-        Camera position in world = -R^T @ t
-
-    For relative transformation T_rel (frame_i relative to frame_0):
-        This gives camera_i's position in frame_0's coordinate system.
+    Uses extract_window_relative_poses to get T_cam0_cami, then extracts translation.
+    T_cam0_cami.translation() = camera i's position in cam0's coordinate frame.
 
     Args:
-        T: pp.SE3 of shape [B, S]
+        T_cam_world: pp.SE3 [B, S], world-to-camera transforms
 
     Returns:
-        positions: [B, S, 3] camera positions
+        positions_rel: [B, S, 3] camera positions relative to frame 0 (in cam0's frame)
     """
-    R = T.rotation().matrix()  # [B, S, 3, 3]
-    t = T.translation()        # [B, S, 3]
-    # Camera position = -R^T @ t
-    positions = -torch.einsum('...ij,...j->...i', R.transpose(-1, -2), t)
-    return positions
+    T_cam0_cami = extract_window_relative_poses(T_cam_world)
+    return T_cam0_cami.translation()
 
 
-def compute_window_relative_poses(pose_enc: torch.Tensor) -> pp.SE3:
+def extract_window_relative_poses(T_cam_world: pp.SE3) -> pp.SE3:
     """
     Convert absolute poses to window-relative (relative to frame 0).
 
-    This avoids the need for global Umeyama/Sim3 alignment and is consistent
-    with sliding-window settings. Frame 0 becomes identity.
+    Computes T_cam0_cami (transform from cami to cam0):
+        T_cam0_cami = T_cam_world[0] @ T_cam_world[i].Inv()
+                    = T_cam0_world @ T_world_cami
 
     Args:
-        pose_enc: [B, S, 9] pose encodings
+        T_cam_world: pp.SE3 [B, S], world-to-camera transforms
 
     Returns:
-        T_rel: pp.SE3 of shape [B, S] where T_rel[b, 0] = Identity
+        T_cam0_cami: pp.SE3 [B, S], transforms from cami to cam0. T_cam0_cami[:, 0] = Identity
     """
-    T_abs = pose_encoding_to_se3(pose_enc)  # [B, S]
-    T_0 = T_abs[:, 0:1]  # [B, 1] - take directly from T_abs, more stable
-
-    # T_rel_i = T_0^{-1} @ T_i
-    T_rel = T_0.Inv() @ T_abs  # [B, S]
-    return T_rel
+    return T_cam_world[:, 0:1] @ T_cam_world.Inv()  # [B, S]
 
 
 def compute_window_scale_batched(
@@ -177,10 +173,9 @@ def compute_window_scale_batched(
     scale_raw = numerator / denominator.clamp(min=1e-8)
 
     # FALLBACK for negative scale: If dot product is negative, GT and Pred motion
-    # directions are fundamentally misaligned (possibly due to coordinate system
-    # differences or prediction errors). Scale fitting doesn't make sense in this
-    # case, so fall back to scale=1.0.
-    # NOTE: This can happen when VGGT predictions have rotational offset from GT.
+    # directions are fundamentally misaligned. This indicates significant prediction
+    # error (e.g., VGGT predicting opposite motion direction). Scale fitting doesn't
+    # make sense in this case, so fall back to scale=1.0.
     scale = torch.where(scale_raw > 0, scale_raw, torch.ones_like(scale_raw))
     scale = scale.clamp(min=0.01, max=100.0)
 
@@ -196,15 +191,15 @@ def compute_window_scale_batched(
     return scale
 
 
-def compute_se3_residual(T_rel_pred: pp.SE3, T_rel_gt: pp.SE3) -> torch.Tensor:
+def compute_se3_residual(T_cam0_cami_pred: pp.SE3, T_cam0_cami_gt: pp.SE3) -> torch.Tensor:
     """
-    Compute SE(3) residual: r = Log(inv(T_gt) @ T_pred).
+    Compute SE(3) residual: r = Log(T_gt.Inv() @ T_pred).
 
     This is "how much Pred deviates from GT" - PGO convention.
 
     Args:
-        T_rel_pred: pp.SE3 [B, S] predicted relative poses (scale-corrected)
-        T_rel_gt: pp.SE3 [B, S] GT relative poses
+        T_cam0_cami_pred: pp.SE3 [B, S] predicted relative poses (scale-corrected)
+        T_cam0_cami_gt: pp.SE3 [B, S] GT relative poses
 
     Returns:
         residual: [B, S, 6] in se(3) [vx, vy, vz, wx, wy, wz]
@@ -212,12 +207,12 @@ def compute_se3_residual(T_rel_pred: pp.SE3, T_rel_gt: pp.SE3) -> torch.Tensor:
                   translation   rotation
                   (meters)      (radians)
     """
-    T_err = T_rel_gt.Inv() @ T_rel_pred
+    T_err = T_cam0_cami_gt.Inv() @ T_cam0_cami_pred
     residual = T_err.Log()  # [B, S, 6]
     return residual
 
 
-def reconstruct_scaled_se3(T_rel: pp.SE3, scale: torch.Tensor) -> pp.SE3:
+def reconstruct_scaled_se3(T_cam0_cami: pp.SE3, scale: torch.Tensor) -> pp.SE3:
     """
     Reconstruct SE3 with scaled translation while keeping rotation.
 
@@ -225,19 +220,19 @@ def reconstruct_scaled_se3(T_rel: pp.SE3, scale: torch.Tensor) -> pp.SE3:
     for numerical stability.
 
     Args:
-        T_rel: pp.SE3 [B, S] relative poses
+        T_cam0_cami: pp.SE3 [B, S] relative poses
         scale: [B] per-window scale factors
 
     Returns:
-        T_rel_scaled: pp.SE3 [B, S] with scaled translations
+        T_cam0_cami_scaled: pp.SE3 [B, S] with scaled translations
     """
     # Get translation and scale it
-    t_rel = T_rel.translation()  # [B, S, 3]
-    t_rel_scaled = scale[:, None, None] * t_rel  # [B, S, 3]
+    t = T_cam0_cami.translation()  # [B, S, 3]
+    t_scaled = scale[:, None, None] * t  # [B, S, 3]
 
     # Get rotation quaternion
-    r_rel = T_rel.rotation()  # pp.SO3 [B, S]
-    q = r_rel.tensor()  # [B, S, 4] in [qx, qy, qz, qw] order
+    r = T_cam0_cami.rotation()  # pp.SO3 [B, S]
+    q = r.tensor()  # [B, S, 4] in [qx, qy, qz, qw] order
 
     # IMPORTANT: Normalize quaternion to prevent numerical drift!
     q = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -248,5 +243,5 @@ def reconstruct_scaled_se3(T_rel: pp.SE3, scale: torch.Tensor) -> pp.SE3:
     q = q * sign
 
     # Build new SE3 with scaled translation
-    T_rel_scaled = pp.SE3(torch.cat([t_rel_scaled, q], dim=-1))
-    return T_rel_scaled
+    T_cam0_cami_scaled = pp.SE3(torch.cat([t_scaled, q], dim=-1))
+    return T_cam0_cami_scaled
