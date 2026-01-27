@@ -69,7 +69,7 @@ class MultitaskLoss(torch.nn.Module):
         # Camera NLL loss for uncertainty - if sqrt_info is predicted and config provided
         if "pose_sqrt_info_list" in predictions and self.camera_nll is not None:
             nll_loss_dict = compute_camera_nll_loss(predictions, batch, **self.camera_nll)
-            nll_loss = nll_loss_dict["loss_camera_nll"] * self.camera_nll["weight"]
+            nll_loss = nll_loss_dict["pose_uncertainty_nll"] * self.camera_nll["weight"]
             total_loss = total_loss + nll_loss
             loss_dict.update(nll_loss_dict)
         
@@ -211,7 +211,7 @@ def compute_camera_nll_loss(
         eps: epsilon for log stability
 
     Returns:
-        dict with 'loss_camera_nll' and various logging metrics
+        dict with 'pose_uncertainty_nll' and various logging metrics
     """
     pred_pose_encodings = pred_dict['pose_enc_list']
     pred_sqrt_info_list = pred_dict['pose_sqrt_info_list']
@@ -317,7 +317,8 @@ def compute_camera_nll_loss(
             valid_count_last = valid_mask.sum(dim=-1).float()
             # Debug metrics for scale investigation
             gt_trans_norm_last = gt_norm  # [B, S-1]
-            pred_trans_norm_last = pred_norm  # [B, S-1]
+            pred_trans_norm_raw_last = pred_norm  # [B, S-1] - before scale
+            pred_trans_norm_scaled_last = scale[:, None] * pred_norm  # [B, S-1] - after scale
             # Debug: dot product for direction analysis
             dot_product = (gt_pos * pred_pos).sum(dim=-1)  # [B, S-1]
             pred_sq = (pred_pos ** 2).sum(dim=-1)          # [B, S-1]
@@ -351,11 +352,41 @@ def compute_camera_nll_loss(
     scale_at_min = (scale_last <= 0.01 + 1e-6).float().mean().detach()
     scale_at_max = (scale_last >= 100.0 - 1e-6).float().mean().detach()
 
+    # === NEW: Diagnostic metrics for overconfidence detection ===
+    # A) sqrt_info percentiles and clamp hit rate
+    # Flatten for percentile computation: [B, S-1, 3] -> [B*(S-1)*3]
+    si_rot_flat = si_rot.reshape(-1)
+    si_trans_flat = si_trans.reshape(-1)
+
+    # Percentiles (p90, p99)
+    sqrt_info_rot_p90 = torch.quantile(si_rot_flat, 0.90).detach()
+    sqrt_info_rot_p99 = torch.quantile(si_rot_flat, 0.99).detach()
+    sqrt_info_trans_p90 = torch.quantile(si_trans_flat, 0.90).detach()
+    sqrt_info_trans_p99 = torch.quantile(si_trans_flat, 0.99).detach()
+
+    # Clamp hit rate (fraction hitting upper bound)
+    # Use the clamp bounds from function args
+    sqrt_info_rot_upper = sqrt_info_rot_inv_rad_clamp[1]
+    sqrt_info_trans_upper = sqrt_info_trans_inv_meter_clamp[1]
+    sqrt_info_rot_clamp_hit = (si_rot >= sqrt_info_rot_upper - 1e-3).float().mean().detach()
+    sqrt_info_trans_clamp_hit = (si_trans >= sqrt_info_trans_upper - 1e-3).float().mean().detach()
+
+    # B) Residual distribution (rot/trans p90)
+    # residual is [B, S-1, 6], split into trans[:3] and rot[3:]
+    residual_trans_last, residual_rot_last = split_se3_tangent(
+        compute_se3_residual(T_cam0_cami_pred_scaled, T_cam0_cami_gt)[:, 1:]
+    )
+    # Compute norm for each frame: [B, S-1]
+    residual_rot_norm = residual_rot_last.norm(dim=-1).reshape(-1)  # radians
+    residual_trans_norm = residual_trans_last.norm(dim=-1).reshape(-1)  # meters
+    residual_rot_p90 = torch.quantile(residual_rot_norm, 0.90).detach()
+    residual_trans_p90 = torch.quantile(residual_trans_norm, 0.90).detach()
+
     return {
-        "loss_camera_nll": total_nll / n_stages,
+        "pose_uncertainty_nll": total_nll / n_stages,
         # For TensorBoard logging:
-        "nll_rot": nll_rot.mean().detach(),
-        "nll_trans": nll_trans.mean().detach(),
+        "rot_uncertainty_nll": nll_rot.mean().detach(),
+        "trans_uncertainty_nll": nll_trans.mean().detach(),
         "sqrt_info_rot_inv_rad_mean": si_rot.mean().detach(),
         "sqrt_info_trans_inv_meter_mean": si_trans.mean().detach(),
         "d2_rot_mean": d2_rot.mean().detach(),    # expect ~3 if calibrated
@@ -366,15 +397,27 @@ def compute_camera_nll_loss(
         "scale_valid_count_mean": valid_count_last.mean().detach(),
         # Clamp ratio (should be < 0.1 for smoke test, 0 for production)
         "residual_sq_clamped_ratio": residual_sq_clamped_ratio,
-        # Debug: scale investigation
+        # Debug: scale investigation (compare raw vs scaled to verify scale fitting works)
         "gt_trans_norm_mean": gt_trans_norm_last.mean().detach(),
-        "pred_trans_norm_mean": pred_trans_norm_last.mean().detach(),
+        "pred_trans_norm_raw_mean": pred_trans_norm_raw_last.mean().detach(),  # before scale
+        "pred_trans_norm_scaled_mean": pred_trans_norm_scaled_last.mean().detach(),  # after scale
         "scale_at_min_ratio": scale_at_min,
         "scale_at_max_ratio": scale_at_max,
         # Debug: dot product analysis (direction mismatch)
         "scale_numerator": scale_numerator_last.mean().detach(),  # negative = opposite direction
         "scale_denominator": scale_denominator_last.mean().detach(),
         "scale_raw": scale_raw_last.mean().detach(),  # before clamping
+        # Diagnostic: sqrt_info percentiles (detect clamp collapse)
+        "sqrt_info_rot_p90": sqrt_info_rot_p90,
+        "sqrt_info_rot_p99": sqrt_info_rot_p99,
+        "sqrt_info_trans_p90": sqrt_info_trans_p90,
+        "sqrt_info_trans_p99": sqrt_info_trans_p99,
+        # Diagnostic: clamp hit rate (fraction at upper bound)
+        "sqrt_info_rot_clamp_hit": sqrt_info_rot_clamp_hit,
+        "sqrt_info_trans_clamp_hit": sqrt_info_trans_clamp_hit,
+        # Diagnostic: residual distribution (detect if r is large while λ is high)
+        "residual_rot_p90": residual_rot_p90,  # radians
+        "residual_trans_p90": residual_trans_p90,  # meters
     }
 
 

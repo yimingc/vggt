@@ -204,8 +204,8 @@ def run_smoke_test(args):
         losses.append(loss_val)
         metrics = {
             'loss': loss_val,
-            'nll_rot': loss_dict['nll_rot'].item(),
-            'nll_trans': loss_dict['nll_trans'].item(),
+            'rot_uncertainty_nll': loss_dict['rot_uncertainty_nll'].item(),
+            'trans_uncertainty_nll': loss_dict['trans_uncertainty_nll'].item(),
             'sqrt_info_rot_inv_rad_mean': loss_dict['sqrt_info_rot_inv_rad_mean'].item(),
             'sqrt_info_trans_inv_meter_mean': loss_dict['sqrt_info_trans_inv_meter_mean'].item(),
             'd2_rot_mean': loss_dict['d2_rot_mean'].item(),
@@ -218,7 +218,8 @@ def run_smoke_test(args):
             'has_nan': has_nan,
             # Debug: scale investigation
             'gt_trans_norm_mean': loss_dict['gt_trans_norm_mean'].item(),
-            'pred_trans_norm_mean': loss_dict['pred_trans_norm_mean'].item(),
+            'pred_trans_norm_raw_mean': loss_dict['pred_trans_norm_raw_mean'].item(),
+            'pred_trans_norm_scaled_mean': loss_dict['pred_trans_norm_scaled_mean'].item(),
             'scale_at_min_ratio': loss_dict['scale_at_min_ratio'].item(),
             'scale_at_max_ratio': loss_dict['scale_at_max_ratio'].item(),
             # Debug: dot product analysis
@@ -237,13 +238,14 @@ def run_smoke_test(args):
             elif scale_val >= 99.9:
                 scale_flag = " [AT MAX!]"
             print(f"Iter {iteration+1:3d} | loss: {loss_val:.4f} | "
-                  f"nll_rot: {metrics['nll_rot']:.3f} | nll_trans: {metrics['nll_trans']:.3f} | "
+                  f"rot_nll: {metrics['rot_uncertainty_nll']:.3f} | trans_nll: {metrics['trans_uncertainty_nll']:.3f} | "
                   f"d²_rot: {metrics['d2_rot_mean']:.2f} | d²_trans: {metrics['d2_trans_mean']:.2f} | "
                   f"scale: {scale_val:.3f}{scale_flag} | grad: {grad_norm:.4f}")
             # Print debug info when scale is at extreme
             if scale_flag:
                 print(f"        DEBUG: gt_norm={metrics['gt_trans_norm_mean']:.4f}m, "
-                      f"pred_norm={metrics['pred_trans_norm_mean']:.4f}m, "
+                      f"pred_raw={metrics['pred_trans_norm_raw_mean']:.4f}m, "
+                      f"pred_scaled={metrics['pred_trans_norm_scaled_mean']:.4f}m, "
                       f"valid_count={metrics['scale_valid_count']:.1f}")
                 print(f"        DEBUG: numerator={metrics['scale_numerator']:.6f}, "
                       f"denominator={metrics['scale_denominator']:.6f}, "
