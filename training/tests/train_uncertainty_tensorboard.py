@@ -11,6 +11,10 @@ Usage:
 
     # With WandB:
     python training/tests/train_uncertainty_tensorboard.py --tum_dir /path/to/tum --num_iters 500 --wandb
+
+    # With checkpoint saving:
+    python training/tests/train_uncertainty_tensorboard.py --tum_dir /path/to/tum --num_iters 2000 \\
+        --checkpoint_dir ./checkpoints --save_interval 500 --wandb
 """
 
 import os
@@ -44,6 +48,60 @@ def freeze_except_uncertainty(model):
             param.requires_grad = True
         else:
             param.requires_grad = False
+
+
+def save_checkpoint(model, optimizer, iteration, loss_dict, checkpoint_dir, filename):
+    """Save checkpoint with only uncertainty head weights.
+
+    Only saves the pose_log_var_branch parameters (~8MB) instead of full model (~4GB).
+    """
+    # Extract only uncertainty head state dict
+    uncertainty_state_dict = {
+        name: param.cpu() for name, param in model.named_parameters()
+        if 'pose_log_var_branch' in name
+    }
+
+    checkpoint = {
+        'iteration': iteration,
+        'uncertainty_head_state_dict': uncertainty_state_dict,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss_dict['pose_uncertainty_nll'].item(),
+        'd2_rot_mean': loss_dict['d2_rot_mean'].item(),
+        'd2_trans_mean': loss_dict['d2_trans_mean'].item(),
+        'sigma_rot_mean': loss_dict['sigma_rot_mean'].item(),
+        'sigma_trans_mean': loss_dict['sigma_trans_mean'].item(),
+    }
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, filename)
+    torch.save(checkpoint, path)
+    return path
+
+
+def load_checkpoint(model, optimizer, checkpoint_path):
+    """Load checkpoint and restore uncertainty head weights.
+
+    Returns:
+        iteration: The iteration number from the checkpoint
+    """
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+    # Load uncertainty head weights
+    model_state_dict = model.state_dict()
+    for name, param in checkpoint['uncertainty_head_state_dict'].items():
+        if name in model_state_dict:
+            model_state_dict[name].copy_(param)
+        else:
+            print(f"Warning: {name} not found in model")
+
+    # Load optimizer state
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    print(f"Loaded checkpoint from iteration {checkpoint['iteration']}")
+    print(f"  d²_rot: {checkpoint['d2_rot_mean']:.2f}, d²_trans: {checkpoint['d2_trans_mean']:.2f}")
+
+    return checkpoint['iteration']
 
 
 def verify_trainable_params(model):
@@ -146,13 +204,28 @@ def run_training(args):
     # Import loss function
     from training.loss import compute_camera_nll_loss
 
+    # Checkpoint tracking
+    start_iteration = 0
+    best_calibration_error = float('inf')  # |d²_mean - 3|
+    checkpoint_enabled = args.checkpoint_dir is not None
+
+    if checkpoint_enabled:
+        print(f"\nCheckpoint saving enabled:")
+        print(f"  Directory: {args.checkpoint_dir}")
+        print(f"  Save interval: {args.save_interval}")
+
+    # Resume from checkpoint if specified
+    if args.resume:
+        start_iteration = load_checkpoint(model, optimizer, args.resume)
+        print(f"Resuming from iteration {start_iteration}")
+
     # Training loop
     print(f"\nStarting training for {args.num_iters} iterations...")
     print("-"*60)
 
     model.train()
 
-    for iteration in range(args.num_iters):
+    for iteration in range(start_iteration, args.num_iters):
         # Get batch
         seq_idx = iteration % len(dataset.sequence_list)
         batch = dataset.get_data(seq_index=seq_idx, img_per_seq=args.num_frames, ids=None, aspect_ratio=1.0)
@@ -298,6 +371,39 @@ def run_training(args):
                   f"d²_trans: {loss_dict['d2_trans_mean'].item():.2f} | "
                   f"scale: {loss_dict['scale_mean'].item():.3f}")
 
+        # Checkpoint saving
+        if checkpoint_enabled:
+            # Compute calibration error: |d²_rot - 3| + |d²_trans - 3|
+            # Perfect calibration means d² ≈ 3 for χ²(3)
+            d2_rot = loss_dict['d2_rot_mean'].item()
+            d2_trans = loss_dict['d2_trans_mean'].item()
+            calibration_error = abs(d2_rot - 3.0) + abs(d2_trans - 3.0)
+
+            # Save best checkpoint (based on calibration)
+            if calibration_error < best_calibration_error:
+                best_calibration_error = calibration_error
+                path = save_checkpoint(
+                    model, optimizer, step, loss_dict,
+                    args.checkpoint_dir, "best.pt"
+                )
+                print(f"  → New best checkpoint saved (calibration_error={calibration_error:.2f})")
+
+            # Save periodic checkpoint
+            if step % args.save_interval == 0:
+                path = save_checkpoint(
+                    model, optimizer, step, loss_dict,
+                    args.checkpoint_dir, f"iter_{step:06d}.pt"
+                )
+                print(f"  → Checkpoint saved: {path}")
+
+    # Save final checkpoint
+    if checkpoint_enabled:
+        path = save_checkpoint(
+            model, optimizer, args.num_iters, loss_dict,
+            args.checkpoint_dir, "final.pt"
+        )
+        print(f"\nFinal checkpoint saved: {path}")
+
     writer.close()
     if use_wandb:
         wandb.finish()
@@ -308,6 +414,10 @@ def run_training(args):
     print(f"Run: tensorboard --logdir {args.log_dir}")
     if use_wandb:
         print(f"WandB run: https://wandb.ai")
+    if checkpoint_enabled:
+        print(f"Checkpoints saved to: {args.checkpoint_dir}")
+        print(f"  - best.pt (calibration_error={best_calibration_error:.2f})")
+        print(f"  - final.pt")
     print(f"{'='*60}")
 
 
@@ -330,6 +440,12 @@ def main():
                         help='Clamp residual_sq (for stability)')
     parser.add_argument('--wandb', action='store_true',
                         help='Enable WandB logging')
+    parser.add_argument('--checkpoint_dir', type=str, default=None,
+                        help='Directory to save checkpoints (disabled if not set)')
+    parser.add_argument('--save_interval', type=int, default=500,
+                        help='Save checkpoint every N iterations')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
     args = parser.parse_args()
 
     run_training(args)

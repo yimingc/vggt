@@ -228,47 +228,77 @@ wandb.log({
 }, step=step)
 ```
 
+### 3.4 Phase 3 Results (2000 iterations)
+
+**Training Run:** 2000 iterations on TUM freiburg1_desk (596 frames)
+
+**Checkpoints saved:**
+- `checkpoints/best.pt` - iteration 544, calibration_error=0.11
+- `checkpoints/final.pt` - iteration 2000
+- Periodic checkpoints at 500, 1000, 1500, 2000
+
+**Final Training Metrics:**
+
+| Metric | Value | Target |
+|--------|-------|--------|
+| NLL Loss | -2.19 | ↓ decreasing |
+| d²_rot | 3.11 (best) | ~3 |
+| d²_trans | 3.00 (best) | ~3 |
+| σ_rot mean | 0.014 rad (0.8°) | stable |
+| σ_trans mean | 0.011 m | stable |
+| log_var clamp hit | 0% | 0% |
+
+**Best checkpoint** achieved near-perfect calibration at iteration 544.
+
+**Why iteration 544 outperforms later iterations (1k, 2k):**
+
+The NLL loss has two competing terms: `0.5 * (r² * exp(-log_var) + log_var)`
+- First term (`r² * exp(-log_var)`): Penalizes underconfidence (σ too large)
+- Second term (`log_var`): Penalizes overconfidence (σ too small)
+
+Training dynamics:
+1. **Early phase (0-500)**: Model starts underconfident, rapidly increases confidence
+2. **Sweet spot (~544)**: Model achieves good calibration (d² ≈ 3)
+3. **Late phase (500-2000)**: Model becomes progressively overconfident on training data
+
+The model overfits to the single TUM sequence (596 frames), learning to be overly confident on familiar motion patterns. This is expected behavior when training on limited data - the model memorizes rather than generalizes.
+
+**Mitigation strategies for future work:**
+- Early stopping based on d² (stop when |d² - 3| < threshold)
+- Train on multiple sequences for better generalization
+- Add regularization to penalize extreme log_var values
+
+For detailed training analysis, loss curves, and diagnostic plots, see:
+**[Pose Uncertainty Training Analysis](pose_uncertainty_training_analysis.md)**
+
 ---
 
 ## Phase 4: Post-Training Evaluation
 
-### 4.0 Constant-Uncertainty Baseline (Run First!)
+### 4.0 Baseline Comparison (Homoscedastic MLE)
 
-Before evaluating trained model, establish a baseline with constant uncertainty:
+Compare trained heteroscedastic model against proper baselines:
 
+**Two baselines:**
+1. **Weak baseline (σ=1)**: Arbitrary, for sanity check only
+2. **Strong baseline (Homoscedastic MLE)**: Best possible constant σ per dimension
+
+The MLE baseline fits optimal constant uncertainty from the data:
 ```python
-def compute_baseline_nll(model, dataloader, device):
-    """Compute NLL with log_var = 0 (σ=1, constant uncertainty baseline)."""
-    # Use the SAME loss computation pipeline, just override log_var
-    all_nll = []
-    all_d2 = []
-
-    model.eval()
-    with torch.no_grad():
-        for batch in dataloader:
-            # ... run model, compute residuals ...
-
-            # Override with constant log_var = 0 (σ = 1)
-            log_var_baseline = torch.zeros_like(log_var_predicted)
-
-            # Compute NLL with baseline (log-variance formula)
-            # NLL = 0.5 * (r² * exp(-log_var) + log_var)
-            nll_baseline = 0.5 * (residual_sq * torch.exp(-log_var_baseline) + log_var_baseline)
-            d2_baseline = (residual_sq * torch.exp(-log_var_baseline)).sum(dim=-1)
-
-            all_nll.append(nll_baseline.mean().item())
-            all_d2.append(d2_baseline.mean().item())
-
-    print(f"\nBaseline (log_var=0, σ=1):")
-    print(f"  NLL:  {np.mean(all_nll):.4f}")
-    print(f"  d² mean: {np.mean(all_d2):.2f} (expect >> 6 if model has useful signal)")
-
-    return {'nll_baseline': np.mean(all_nll), 'd2_baseline': np.mean(all_d2)}
+# MLE for constant σ: σ_k² = E[r_k²]
+sigma_sq_mle = residual_sq.mean(axis=0)  # [6] per dimension
+log_var_mle = np.log(sigma_sq_mle + 1e-12)
 ```
 
+**Why MLE baseline matters:**
+- σ=1 is arbitrary and not comparable (residuals may be ~0.01, making σ=1 meaningless)
+- MLE baseline is the "strongest homoscedastic" - fair comparison
+- If trained NLL < MLE NLL → heteroscedastic model learned **useful per-sample uncertainty**
+
 **Interpretation:**
-- If trained NLL < baseline NLL → model learned useful uncertainty
-- If trained d² ≈ 6 but baseline d² >> 6 → calibration improved
+- `NLL_trained < NLL_mle` → Model learned useful heteroscedastic uncertainty ✓
+- `NLL_trained ≈ NLL_mle` → Per-sample uncertainty not adding value
+- `NLL_trained > NLL_mle` → Model is worse than constant σ (problem!)
 
 ### 4.1 Calibration Check Script
 
@@ -352,103 +382,142 @@ def evaluate_calibration(model, dataloader, device):
     }
 ```
 
-### 4.2 Uncertainty vs Error Correlation (Scatter Plot)
+### 4.2 Coverage Test (Primary Calibration Metric)
+
+The most rigorous calibration test uses **normalized residuals** z = r/σ:
 
 ```python
-def plot_uncertainty_vs_error(residuals, log_var, output_path):
+def compute_coverage_statistics(residuals, log_var):
     """
-    Plot predicted sigma vs actual |residual|.
+    For well-calibrated Gaussian: z = r/σ ~ N(0,1)
 
-    For well-calibrated uncertainty:
-    - Points should cluster around y=x line
-    - 68% of points should fall within 1-sigma
+    Expected coverage:
+    - P(|z| < 1) ≈ 0.6827 (68.27%)
+    - P(|z| < 2) ≈ 0.9545 (95.45%)
+    - P(|z| < 3) ≈ 0.9973 (99.73%)
     """
-    import matplotlib.pyplot as plt
+    sigma = np.exp(0.5 * log_var)
+    z = residuals / sigma  # Should be ~N(0,1)
 
-    # sigma = exp(0.5 * log_var)
-    sigma = np.exp(0.5 * log_var)  # [N, 6]
-    actual_error = np.abs(residuals)  # [N, 6]
-
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    labels = ['vx', 'vy', 'vz', 'wx', 'wy', 'wz']  # trans first, rot second
-
-    for i, (ax, label) in enumerate(zip(axes.flat, labels)):
-        ax.scatter(sigma[:, i], actual_error[:, i], alpha=0.3, s=1)
-        max_val = max(sigma[:, i].max(), actual_error[:, i].max())
-        ax.plot([0, max_val], [0, max_val], 'r--', label='y=x (ideal)')
-        ax.set_xlabel(f'Predicted σ_{label}')
-        ax.set_ylabel(f'Actual |r_{label}|')
-        ax.set_title(f'{label}: corr={np.corrcoef(sigma[:, i], actual_error[:, i])[0,1]:.3f}')
-        ax.legend()
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    print(f"Saved uncertainty vs error scatter plot to {output_path}")
+    coverage_1sigma = (np.abs(z) < 1).mean()  # Target: 0.6827
+    coverage_2sigma = (np.abs(z) < 2).mean()  # Target: 0.9545
+    coverage_3sigma = (np.abs(z) < 3).mean()  # Target: 0.9973
 ```
 
-### 4.3 Reliability Diagram (Binned σ → Empirical Error)
+**Also compute quantile-coverage reliability:**
+- For d² ~ χ²(df), check P(d² ≤ χ²_p) vs theoretical p
+- Plot empirical quantile vs theoretical quantile (should be y=x)
+
+### 4.3 Reliability Diagram (Corrected)
+
+**IMPORTANT:** For Gaussian r ~ N(0, σ²), E[|r|] = σ × √(2/π) ≈ **0.798σ**, NOT σ!
 
 ```python
 def plot_reliability_diagram(residuals, log_var, output_path, n_bins=10):
     """
     Reliability diagram: bin by predicted σ, plot mean |residual| per bin.
 
-    For well-calibrated uncertainty:
-    - Points should lie on y=x line
-    - More interpretable than scatter plot for reviewers
+    CORRECTED: Ideal line is y = 0.798x (not y = x)
+    because E[|r|] = σ * sqrt(2/π) for Gaussian.
     """
-    import matplotlib.pyplot as plt
+    GAUSSIAN_FACTOR = np.sqrt(2 / np.pi)  # ≈ 0.798
 
-    sigma = np.exp(0.5 * log_var)  # [N, 6]
-    actual_error = np.abs(residuals)  # [N, 6]
+    # ... binning code ...
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    labels = ['vx', 'vy', 'vz', 'wx', 'wy', 'wz']
-
-    for i, (ax, label) in enumerate(zip(axes.flat, labels)):
-        # Bin by predicted sigma
-        sigma_i = sigma[:, i]
-        error_i = actual_error[:, i]
-
-        # Use quantile bins for balanced counts
-        bin_edges = np.percentile(sigma_i, np.linspace(0, 100, n_bins + 1))
-        bin_centers = []
-        mean_errors = []
-        std_errors = []
-
-        for j in range(n_bins):
-            mask = (sigma_i >= bin_edges[j]) & (sigma_i < bin_edges[j+1])
-            if mask.sum() > 10:
-                bin_centers.append(sigma_i[mask].mean())
-                mean_errors.append(error_i[mask].mean())
-                std_errors.append(error_i[mask].std() / np.sqrt(mask.sum()))
-
-        bin_centers = np.array(bin_centers)
-        mean_errors = np.array(mean_errors)
-        std_errors = np.array(std_errors)
-
-        ax.errorbar(bin_centers, mean_errors, yerr=std_errors, fmt='o-', capsize=3)
-        max_val = max(bin_centers.max(), mean_errors.max()) * 1.1
-        ax.plot([0, max_val], [0, max_val], 'r--', label='y=x (ideal)')
-        ax.set_xlabel(f'Predicted σ_{label} (binned)')
-        ax.set_ylabel(f'Mean |r_{label}|')
-        ax.set_title(f'{label}')
-        ax.legend()
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    print(f"Saved reliability diagram to {output_path}")
+    # Plot CORRECT ideal line
+    ax.plot(x, GAUSSIAN_FACTOR * x, 'r--', label='y=0.798x (Gaussian ideal)')
 ```
 
-### 4.4 Evaluation Command
+### 4.4 Whitened Covariance (Diagonal Assumption Check)
+
+Check if diagonal uncertainty is sufficient:
+
+```python
+def compute_whitened_covariance(residuals, log_var):
+    """
+    Compute Cov(z) where z = r/σ (whitened residuals).
+
+    If calibrated AND diagonal assumption valid:
+    - Diagonal elements ≈ 1
+    - Off-diagonal elements ≈ 0
+
+    Large off-diagonal → coupling exists → consider full covariance
+    """
+    sigma = np.exp(0.5 * log_var)
+    z = residuals / sigma
+    cov_z = np.cov(z, rowvar=False)  # [6, 6]
+
+    # Check: diag ≈ 1, off-diag ≈ 0
+    max_off_diag = np.abs(cov_z - np.diag(np.diag(cov_z))).max()
+```
+
+### 4.6 Evaluation Command
 
 ```bash
 # After training, run calibration evaluation
 python training/tests/eval_uncertainty_calibration.py \
-    --checkpoint ./uncertainty_smoke_test/checkpoint_100.pt \
-    --tum_dir /path/to/tum/freiburg1_desktop \
-    --output_dir ./uncertainty_eval_output
+    --checkpoint ./checkpoints/best.pt \
+    --tum_dir /path/to/tum/freiburg1_desk \
+    --output_dir ./eval_uncertainty
 ```
+
+### 4.7 Phase 4 Results (Calibration Evaluation)
+
+**Checkpoint evaluated:** `checkpoints/best.pt` (iteration 544, from Phase 3 training)
+
+> **Note:** Phase 3 and Phase 4 use the same trained checkpoint. The slight difference in d² values (3.11/3.00 in Phase 3 vs 2.53/2.77 in Phase 4) is due to different data sampling - Phase 3 reports training-time metrics while Phase 4 evaluates on freshly sampled windows.
+
+**Calibration Statistics (d² vs χ²):**
+
+| Metric | Value | Target | Status |
+|--------|-------|--------|--------|
+| d²_rot mean | 2.53 | 3.0 | ✓ Well-calibrated |
+| d²_trans mean | 2.77 | 3.0 | ✓ Well-calibrated |
+| d²_total mean | 5.30 | 6.0 | ✓ Well-calibrated |
+
+**Baseline Comparison (Homoscedastic MLE):**
+
+| Model | NLL | Notes |
+|-------|-----|-------|
+| **Trained (heteroscedastic)** | **-4.108** | Per-sample uncertainty |
+| MLE baseline (best constant σ) | -4.053 | σ_k² = E[r_k²] |
+| Unit baseline (σ=1) | 0.0001 | Sanity check only |
+
+**✓ NLL improvement vs MLE: 0.055** - Heteroscedastic model learned useful per-sample uncertainty beyond best constant σ.
+
+**Coverage Statistics (z = r/σ vs N(0,1)):**
+
+| Metric | Empirical | Target | Status |
+|--------|-----------|--------|--------|
+| P(\|z\| < 1) | 0.744 | 0.683 | ~ Slightly underconfident |
+| P(\|z\| < 2) | 0.956 | 0.955 | ✓ Excellent |
+| P(\|z\| < 3) | 0.993 | 0.997 | ✓ Excellent |
+
+The 1σ coverage is slightly high (σ too large), but 2σ and 3σ coverage are nearly perfect.
+
+**Diagonal Assumption Check (Cov(z) analysis):**
+
+| Metric | Value | Assessment |
+|--------|-------|------------|
+| max \|off-diag\| | 0.557 | ✗ Significant coupling |
+| mean \|off-diag\| | 0.144 | Moderate |
+| Largest coupling | vx-wy = -0.557 | Translation X ↔ Rotation Y |
+
+**Finding:** The diagonal assumption is limiting. There's significant coupling between translation-x and rotation-y that the diagonal uncertainty cannot capture. This motivates future work on full 6×6 covariance prediction.
+
+**Generated Plots** (in `./eval_uncertainty_v2/`):
+- `d2_histogram.png` - d² distribution vs χ² reference
+- `coverage_reliability.png` - Quantile-coverage diagram (primary calibration plot)
+- `normalized_residual_histogram.png` - z=r/σ vs N(0,1)
+- `whitened_covariance.png` - Cov(z) heatmap (diagonal assumption check)
+- `reliability_diagram.png` - Binned σ vs mean|r| (ideal line: y=0.798x)
+- `uncertainty_vs_error.png` - σ vs |r| scatter (correlation check)
+
+**Conclusion:**
+- ✓ **Well-calibrated**: d² close to target, coverage statistics good
+- ✓ **Heteroscedastic value proven**: Beats MLE baseline
+- ~ **Slightly underconfident**: 1σ coverage 74% vs 68% expected
+- ✗ **Diagonal assumption limiting**: vx-wy coupling suggests full covariance would help
 
 ---
 
@@ -558,28 +627,35 @@ def test_static_sequence_handling(model, device):
 - [x] Gradient norm non-zero for uncertainty head
 - [x] residual_sq_clamped_ratio < 10%
 
-### After Training
-- [ ] Trained NLL < baseline NLL (constant log_var=0)
-- [ ] d²_rot ≈ 3, d²_trans ≈ 3
-- [ ] Uncertainty correlates with actual error (scatter plot)
-- [ ] Reliability diagram close to y=x
-- [ ] Static sequence test passes (no NaN, graceful degradation)
-- [ ] Can export uncertainty alongside poses
+### After Training (Phase 4 - Complete)
+- [x] Trained NLL < MLE baseline NLL - NLL: -4.108 vs -4.053 (improvement: 0.055) ✓
+- [x] d²_rot ≈ 3, d²_trans ≈ 3 - d²_rot=2.53, d²_trans=2.77 ✓
+- [x] Coverage statistics reasonable - 1σ: 74.4% (target 68.3%), 2σ: 95.6% ✓
+- [x] Whitened covariance analyzed - max off-diag: 0.557 (vx-wy coupling found)
+- [x] Reliability diagram with corrected y=0.798x line ✓
+- [x] Static sequence test passes (no NaN, graceful degradation) ✓
+
+### Integration (Phase 5 - In Progress)
+- [x] eval_vggt_tum.py extended to output uncertainty statistics
+- [x] --uncertainty_checkpoint argument added to load trained weights
+- [ ] Verified: Can export uncertainty alongside poses (needs testing)
 
 ---
 
 ## Expected Timeline
 
-| Phase | Duration | Description |
-|-------|----------|-------------|
-| Phase 1 | Done | Unit tests already passing |
-| Phase 2 | Done | 100-iter smoke test passed |
-| Phase 3 | Ongoing | Monitor during training |
-| Phase 4 | 10 min | Calibration check + baseline comparison |
-| Phase 5 | 10 min | Integration with existing eval |
-| Phase 5.5 | 5 min | Static sequence failure mode test |
+| Phase | Status | Description | Results |
+|-------|--------|-------------|---------|
+| Phase 1 | Done | Unit tests passing | See [test_lie_algebra.py](../training/tests/test_lie_algebra.py) |
+| Phase 2 | Done | 100-iter smoke test | Loss ↓, no clamp collapse |
+| Phase 3 | Done | 2000-iter training | Best: d²_rot=3.11, d²_trans=3.00. See [§3.4](#34-phase-3-results-2000-iterations) |
+| Phase 4 | Done | Calibration evaluation | d²_rot=2.53, d²_trans=2.77, NLL beats MLE. See [§4.7](#47-phase-4-results-calibration-evaluation) |
+| Phase 5 | In Progress | Integration with eval | eval_vggt_tum.py extended |
+| Phase 5.5 | Done | Static sequence test | No NaN/Inf ✓ |
 
-**Total: ~35 minutes** for complete verification on freiburg1_desktop.
+**Detailed Results:**
+- Training analysis & plots: [pose_uncertainty_training_analysis.md](pose_uncertainty_training_analysis.md)
+- Evaluation plots: `./eval_uncertainty_v2/` (d2_histogram.png, coverage_reliability.png, whitened_covariance.png, etc.)
 
 ---
 

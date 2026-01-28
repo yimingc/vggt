@@ -353,6 +353,23 @@ def evaluate_sequence(dataset, seq_index, num_frames, model, device, dtype,
         )
         pred_poses = pred_extri[0].float().cpu().numpy()
 
+        # Output uncertainty statistics if available
+        if 'pose_log_var_list' in predictions:
+            log_var = predictions['pose_log_var_list'][-1]  # [1, S, 6]
+
+            # Convert to sigma (standard deviation): σ = exp(0.5 * log_var)
+            sigma = torch.exp(0.5 * log_var)  # [1, S, 6]
+
+            # PyPose se(3) convention: [:3] = trans, [3:] = rot
+            sigma_trans = sigma[0, :, :3].cpu().numpy()  # [S, 3]
+            sigma_rot = sigma[0, :, 3:].cpu().numpy()    # [S, 3]
+
+            print(f"\n  Uncertainty Statistics:")
+            print(f"    σ_trans: mean={sigma_trans.mean():.4f} m, std={sigma_trans.std():.4f} m")
+            print(f"    σ_rot:   mean={sigma_rot.mean():.4f} rad ({np.degrees(sigma_rot.mean()):.2f}°)")
+            print(f"    σ_trans range: [{sigma_trans.min():.4f}, {sigma_trans.max():.4f}] m")
+            print(f"    σ_rot range:   [{sigma_rot.min():.4f}, {sigma_rot.max():.4f}] rad")
+
         # Store full predictions for viser visualization if requested
         if return_vggt_predictions:
             predictions["extrinsic"] = pred_extri
@@ -405,7 +422,7 @@ def evaluate_sequence(dataset, seq_index, num_frames, model, device, dtype,
     print(f"    Trans: {rpe_trans_sim3 * 100:.2f} cm")
     print(f"    Rot:   {rpe_rot_sim3:.2f}°")
 
-    return {
+    results = {
         'ate_trans_rmse_se3': ate_se3['trans_rmse'],
         'ate_trans_mean_se3': ate_se3['trans_mean'],
         'ate_rot_rmse_se3': ate_se3['rot_rmse'],
@@ -425,6 +442,60 @@ def evaluate_sequence(dataset, seq_index, num_frames, model, device, dtype,
         'vggt_predictions': vggt_predictions,
     }
 
+    # Add uncertainty statistics if available
+    if not dryrun and 'pose_log_var_list' in predictions:
+        log_var = predictions['pose_log_var_list'][-1]  # [1, S, 6]
+        sigma = torch.exp(0.5 * log_var)
+        sigma_trans = sigma[0, :, :3].cpu().numpy()
+        sigma_rot = sigma[0, :, 3:].cpu().numpy()
+        results['sigma_trans'] = sigma_trans  # [S, 3]
+        results['sigma_rot'] = sigma_rot      # [S, 3]
+        results['sigma_trans_mean'] = float(sigma_trans.mean())
+        results['sigma_rot_mean'] = float(sigma_rot.mean())
+
+    return results
+
+
+def load_uncertainty_checkpoint(model, checkpoint_path, device):
+    """Load trained uncertainty head weights from checkpoint.
+
+    Args:
+        model: VGGT model
+        checkpoint_path: Path to uncertainty checkpoint (e.g., best.pt)
+        device: Device to load to
+
+    Returns:
+        dict with checkpoint metadata (iteration, d2_rot_mean, etc.)
+    """
+    print(f"\nLoading uncertainty checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+    # Load uncertainty head state dict
+    uncertainty_state_dict = checkpoint['uncertainty_head_state_dict']
+
+    # Load into model
+    model_state = model.state_dict()
+    loaded_count = 0
+    for name, param in uncertainty_state_dict.items():
+        if name in model_state:
+            model_state[name].copy_(param.to(device))
+            loaded_count += 1
+        else:
+            print(f"  Warning: {name} not found in model")
+
+    print(f"  Loaded {loaded_count} uncertainty head parameters")
+    print(f"  Checkpoint iteration: {checkpoint.get('iteration', 'unknown')}")
+    print(f"  Checkpoint d²_rot: {checkpoint.get('d2_rot_mean', 'unknown'):.3f}")
+    print(f"  Checkpoint d²_trans: {checkpoint.get('d2_trans_mean', 'unknown'):.3f}")
+
+    return {
+        'iteration': checkpoint.get('iteration'),
+        'd2_rot_mean': checkpoint.get('d2_rot_mean'),
+        'd2_trans_mean': checkpoint.get('d2_trans_mean'),
+        'sigma_rot_mean': checkpoint.get('sigma_rot_mean'),
+        'sigma_trans_mean': checkpoint.get('sigma_trans_mean'),
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate VGGT on TUM RGB-D')
@@ -441,6 +512,8 @@ def main():
                         help='Ending frame index, inclusive (default: last frame)')
     parser.add_argument('--dryrun', action='store_true',
                         help='Dry run: use GT as prediction to verify evaluation pipeline (skip VGGT inference)')
+    parser.add_argument('--uncertainty_checkpoint', type=str, default=None,
+                        help='Path to trained uncertainty head checkpoint (e.g., checkpoints/best.pt)')
     parser.add_argument('--viser', action='store_true', default=True,
                         help='Enable viser 3D visualization (default: enabled)')
     parser.add_argument('--no-viser', dest='viser', action='store_false',
@@ -466,6 +539,7 @@ def main():
     print(f"Frame range: [{args.start_frame}, {end_frame_str}]")
     print(f"Sampling strategy: {args.sampling}")
     print(f"Number of trials: {args.num_trials}")
+    print(f"Uncertainty checkpoint: {args.uncertainty_checkpoint if args.uncertainty_checkpoint else 'None (using default init)'}")
     print(f"Viser visualization: {'enabled (port ' + str(args.viser_port) + ')' if args.viser else 'disabled'}")
     if args.dryrun:
         print(f"*** DRYRUN MODE: Using GT as prediction (skipping VGGT) ***")
@@ -483,6 +557,7 @@ def main():
     )
 
     # Load VGGT model (skip in dryrun mode)
+    uncertainty_checkpoint_meta = None
     if args.dryrun:
         print("\n[DRYRUN] Skipping VGGT model loading")
         model = None
@@ -491,6 +566,12 @@ def main():
         from vggt.models.vggt import VGGT
         model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
         model.eval()
+
+        # Load uncertainty checkpoint if provided
+        if args.uncertainty_checkpoint:
+            uncertainty_checkpoint_meta = load_uncertainty_checkpoint(
+                model, args.uncertainty_checkpoint, device
+            )
 
     # Run evaluation
     all_results = []
@@ -542,6 +623,15 @@ def main():
     print(f"\n[RPE - Sim3 Alignment (with scale)]")
     print(f"  Trans: {np.mean(rpe_trans_sim3)*100:.2f} ± {np.std(rpe_trans_sim3)*100:.2f} cm")
     print(f"  Rot:   {np.mean(rpe_rots_sim3):.2f} ± {np.std(rpe_rots_sim3):.2f}°")
+
+    # Uncertainty summary (if available)
+    if 'sigma_trans_mean' in all_results[0]:
+        sigma_trans_means = [r['sigma_trans_mean'] for r in all_results]
+        sigma_rot_means = [r['sigma_rot_mean'] for r in all_results]
+        print(f"\n[Uncertainty]")
+        print(f"  σ_trans: {np.mean(sigma_trans_means)*100:.2f} ± {np.std(sigma_trans_means)*100:.2f} cm")
+        print(f"  σ_rot:   {np.mean(sigma_rot_means):.4f} ± {np.std(sigma_rot_means):.4f} rad "
+              f"({np.degrees(np.mean(sigma_rot_means)):.2f}°)")
 
     # Save trajectory plot
     import matplotlib
