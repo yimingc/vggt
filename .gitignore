@@ -147,3 +147,12 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+# WandB logs
+wandb/
+
+# TensorBoard logs
+runs/
+
+# TUM evaluation output
+tum_eval_output/

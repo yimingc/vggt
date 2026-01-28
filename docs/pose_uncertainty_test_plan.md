@@ -71,8 +71,7 @@ camera_nll:
   weight: 1.0
   pose_encoding_type: "absT_quaR_FoV"
   gamma: 0.6
-  sqrt_info_rot_clamp: [0.1, 200.0]
-  sqrt_info_trans_clamp: [0.1, 100.0]
+  log_var_clamp: [-20.0, 20.0]  # very loose clamp on log(σ²)
   residual_sq_clamp: 100.0  # safety for smoke test (log clamp ratio!)
   scale_detach: true
   min_translation: 0.02
@@ -108,8 +107,8 @@ def verify_trainable_params(model):
 
     # Sanity check: should be ~2.1M for uncertainty MLP
     assert total_trainable < 5_000_000, f"Too many trainable params: {total_trainable}"
-    assert any('pose_uncertainty_branch' in name for name, _ in trainable), \
-        "pose_uncertainty_branch not in trainable params!"
+    assert any('pose_log_var_branch' in name for name, _ in trainable), \
+        "pose_log_var_branch not in trainable params!"
     print(f"\n✓ Verified: Only uncertainty head is trainable")
 ```
 
@@ -130,18 +129,19 @@ python training/train.py \
 ### 2.4 Success Criteria
 
 After 100 iterations:
-- [x] `loss_camera_nll` decreases (not necessarily monotonic, but trending down)
+- [x] `pose_uncertainty_nll` decreases (not necessarily monotonic, but trending down)
 - [x] No NaN/Inf in loss or gradients
-- [x] `sqrt_info_rot_mean` and `sqrt_info_trans_mean` not stuck at clamp boundaries
+- [x] `log_var_at_min` and `log_var_at_max` are 0 (no clamp collapse)
 - [x] `scale_mean` stable across batches (not collapsing to 0.01 or 100)
 - [x] `residual_sq_clamped_ratio` < 10% (if higher, loss signal is misleading)
 
-**Results (2026-01-27):**
-- Loss: -0.50 → -1.34 (decreasing ✓)
-- sqrt_info_rot: 20.76, sqrt_info_trans: 20.21 (not at clamps ✓)
-- scale: 0.628 (stable ✓)
+**Results (2026-01-27, log-variance parameterization):**
+- Loss: -0.01 → -2.19 (decreasing ✓)
+- sigma_rot: 0.014 rad, sigma_trans: 0.011 m (reasonable values ✓)
+- log_var clamp hit: 0% (no clamp collapse ✓)
+- scale: stable (✓)
 - residual_sq_clamped_ratio: 0.0% (< 10% ✓)
-- d²_rot: 0.07, d²_trans: 0.03 (low, calibration evaluated in Phase 4)
+- d²_rot: 1.68, d²_trans: 3.38 (trans close to target 3! ✓)
 
 ---
 
@@ -151,11 +151,13 @@ After 100 iterations:
 
 | Metric | Expected Behavior | Red Flag |
 |--------|-------------------|----------|
-| `loss_camera_nll` | Decreases over training | Stuck or increasing |
-| `nll_rot` | Decreases | Much larger than `nll_trans` |
-| `nll_trans` | Decreases | Much larger than `nll_rot` |
-| `sqrt_info_rot_mean` | Stabilizes ~1-50 | Stuck at 0.1 or 200 |
-| `sqrt_info_trans_mean` | Stabilizes ~1-20 | Stuck at 0.1 or 100 |
+| `pose_uncertainty_nll` | Decreases over training | Stuck or increasing |
+| `rot_uncertainty_nll` | Decreases | Much larger than `trans_uncertainty_nll` |
+| `trans_uncertainty_nll` | Decreases | Much larger than `rot_uncertainty_nll` |
+| `sigma_rot_mean` | Stabilizes ~0.01-0.1 rad | Near 0 or very large |
+| `sigma_trans_mean` | Stabilizes ~0.01-0.1 m | Near 0 or very large |
+| `log_var_rot_at_min/max` | 0 | > 0 (clamp collapse) |
+| `log_var_trans_at_min/max` | 0 | > 0 (clamp collapse) |
 | `d2_rot_mean` | Approaches 3.0 | >> 10 or << 1 |
 | `d2_trans_mean` | Approaches 3.0 | >> 10 or << 1 |
 | `scale_mean` | **Stable across batches** | All 0.01 or 100 |
@@ -172,12 +174,12 @@ Add to training loop:
 ```python
 # In training loop, after loss computation:
 if step % log_interval == 0:
-    writer.add_scalar('loss/camera_nll', loss_dict['loss_camera_nll'], step)
-    writer.add_scalar('loss/nll_rot', loss_dict['nll_rot'], step)
-    writer.add_scalar('loss/nll_trans', loss_dict['nll_trans'], step)
+    writer.add_scalar('loss/pose_uncertainty_nll', loss_dict['pose_uncertainty_nll'], step)
+    writer.add_scalar('loss/rot_uncertainty_nll', loss_dict['rot_uncertainty_nll'], step)
+    writer.add_scalar('loss/trans_uncertainty_nll', loss_dict['trans_uncertainty_nll'], step)
 
-    writer.add_scalar('uncertainty/sqrt_info_rot_mean', loss_dict['sqrt_info_rot_mean'], step)
-    writer.add_scalar('uncertainty/sqrt_info_trans_mean', loss_dict['sqrt_info_trans_mean'], step)
+    writer.add_scalar('uncertainty/sigma_rot_mean', loss_dict['sigma_rot_mean'], step)
+    writer.add_scalar('uncertainty/sigma_trans_mean', loss_dict['sigma_trans_mean'], step)
 
     writer.add_scalar('calibration/d2_rot_mean', loss_dict['d2_rot_mean'], step)
     writer.add_scalar('calibration/d2_trans_mean', loss_dict['d2_trans_mean'], step)
@@ -190,10 +192,14 @@ if step % log_interval == 0:
     if 'residual_sq_clamped_ratio' in loss_dict:
         writer.add_scalar('debug/residual_sq_clamped_ratio', loss_dict['residual_sq_clamped_ratio'], step)
 
+    # Log log_var clamp hit rate (should be 0)
+    writer.add_scalar('diagnostic/log_var_rot_at_min', loss_dict['log_var_rot_at_min'], step)
+    writer.add_scalar('diagnostic/log_var_rot_at_max', loss_dict['log_var_rot_at_max'], step)
+
     # Gradient norm for uncertainty head
     grad_norm = 0.0
     for name, param in model.named_parameters():
-        if 'pose_uncertainty_branch' in name and param.grad is not None:
+        if 'pose_log_var_branch' in name and param.grad is not None:
             grad_norm += param.grad.norm().item() ** 2
     grad_norm = grad_norm ** 0.5
     writer.add_scalar('grad/uncertainty_head_norm', grad_norm, step)
@@ -208,15 +214,17 @@ wandb.init(project="vggt-uncertainty", name="smoke-test-tum")
 
 # In training loop:
 wandb.log({
-    "loss/camera_nll": loss_dict['loss_camera_nll'].item(),
-    "loss/nll_rot": loss_dict['nll_rot'].item(),
-    "loss/nll_trans": loss_dict['nll_trans'].item(),
-    "uncertainty/sqrt_info_rot_mean": loss_dict['sqrt_info_rot_mean'].item(),
-    "uncertainty/sqrt_info_trans_mean": loss_dict['sqrt_info_trans_mean'].item(),
+    "loss/pose_uncertainty_nll": loss_dict['pose_uncertainty_nll'].item(),
+    "loss/rot_uncertainty_nll": loss_dict['rot_uncertainty_nll'].item(),
+    "loss/trans_uncertainty_nll": loss_dict['trans_uncertainty_nll'].item(),
+    "uncertainty/sigma_rot_mean": loss_dict['sigma_rot_mean'].item(),
+    "uncertainty/sigma_trans_mean": loss_dict['sigma_trans_mean'].item(),
     "calibration/d2_rot_mean": loss_dict['d2_rot_mean'].item(),
     "calibration/d2_trans_mean": loss_dict['d2_trans_mean'].item(),
     "scale/mean": loss_dict['scale_mean'].item(),
     "scale/std": loss_dict['scale_std'].item(),
+    "diagnostic/log_var_rot_at_min": loss_dict['log_var_rot_at_min'].item(),
+    "diagnostic/log_var_rot_at_max": loss_dict['log_var_rot_at_max'].item(),
 }, step=step)
 ```
 
@@ -230,8 +238,8 @@ Before evaluating trained model, establish a baseline with constant uncertainty:
 
 ```python
 def compute_baseline_nll(model, dataloader, device):
-    """Compute NLL with sqrt_info = 1.0 (constant uncertainty baseline)."""
-    # Use the SAME loss computation pipeline, just override sqrt_info
+    """Compute NLL with log_var = 0 (σ=1, constant uncertainty baseline)."""
+    # Use the SAME loss computation pipeline, just override log_var
     all_nll = []
     all_d2 = []
 
@@ -240,18 +248,18 @@ def compute_baseline_nll(model, dataloader, device):
         for batch in dataloader:
             # ... run model, compute residuals ...
 
-            # Override with constant sqrt_info = 1.0
-            sqrt_info_baseline = torch.ones_like(sqrt_info_predicted)
+            # Override with constant log_var = 0 (σ = 1)
+            log_var_baseline = torch.zeros_like(log_var_predicted)
 
-            # Compute NLL with baseline (same formula as training)
-            lambda_diag = sqrt_info_baseline ** 2  # = 1.0
-            nll_baseline = 0.5 * (residual_sq * lambda_diag - 2 * torch.log(sqrt_info_baseline + eps))
-            d2_baseline = (residual_sq * lambda_diag).sum(dim=-1)
+            # Compute NLL with baseline (log-variance formula)
+            # NLL = 0.5 * (r² * exp(-log_var) + log_var)
+            nll_baseline = 0.5 * (residual_sq * torch.exp(-log_var_baseline) + log_var_baseline)
+            d2_baseline = (residual_sq * torch.exp(-log_var_baseline)).sum(dim=-1)
 
             all_nll.append(nll_baseline.mean().item())
             all_d2.append(d2_baseline.mean().item())
 
-    print(f"\nBaseline (sqrt_info=1.0):")
+    print(f"\nBaseline (log_var=0, σ=1):")
     print(f"  NLL:  {np.mean(all_nll):.4f}")
     print(f"  d² mean: {np.mean(all_d2):.2f} (expect >> 6 if model has useful signal)")
 
@@ -347,7 +355,7 @@ def evaluate_calibration(model, dataloader, device):
 ### 4.2 Uncertainty vs Error Correlation (Scatter Plot)
 
 ```python
-def plot_uncertainty_vs_error(residuals, sqrt_info, output_path):
+def plot_uncertainty_vs_error(residuals, log_var, output_path):
     """
     Plot predicted sigma vs actual |residual|.
 
@@ -357,8 +365,8 @@ def plot_uncertainty_vs_error(residuals, sqrt_info, output_path):
     """
     import matplotlib.pyplot as plt
 
-    # sigma = 1 / sqrt_info
-    sigma = 1.0 / sqrt_info  # [N, 6]
+    # sigma = exp(0.5 * log_var)
+    sigma = np.exp(0.5 * log_var)  # [N, 6]
     actual_error = np.abs(residuals)  # [N, 6]
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -381,7 +389,7 @@ def plot_uncertainty_vs_error(residuals, sqrt_info, output_path):
 ### 4.3 Reliability Diagram (Binned σ → Empirical Error)
 
 ```python
-def plot_reliability_diagram(residuals, sqrt_info, output_path, n_bins=10):
+def plot_reliability_diagram(residuals, log_var, output_path, n_bins=10):
     """
     Reliability diagram: bin by predicted σ, plot mean |residual| per bin.
 
@@ -391,7 +399,7 @@ def plot_reliability_diagram(residuals, sqrt_info, output_path, n_bins=10):
     """
     import matplotlib.pyplot as plt
 
-    sigma = 1.0 / sqrt_info  # [N, 6]
+    sigma = np.exp(0.5 * log_var)  # [N, 6]
     actual_error = np.abs(residuals)  # [N, 6]
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -452,15 +460,13 @@ Add uncertainty output to existing evaluation:
 
 ```python
 # In evaluate_sequence(), after VGGT inference:
-if 'pose_sqrt_info_list' in predictions:
-    sqrt_info = predictions['pose_sqrt_info_list'][-1]  # [1, S, 6]
+if 'pose_log_var_list' in predictions:
+    log_var = predictions['pose_log_var_list'][-1]  # [1, S, 6]
 
-    # Convert to sigma (standard deviation)
-    import torch.nn.functional as F
-    sqrt_info_pos = F.softplus(sqrt_info) + 1e-6
-    sigma = 1.0 / sqrt_info_pos  # [1, S, 6]
+    # Convert to sigma (standard deviation): σ = exp(0.5 * log_var)
+    sigma = torch.exp(0.5 * log_var)  # [1, S, 6]
 
-    # Remember: [:3] = trans, [3:] = rot
+    # Remember: [:3] = trans, [3:] = rot (PyPose se(3) convention)
     sigma_trans = sigma[0, :, :3].cpu().numpy()  # [S, 3]
     sigma_rot = sigma[0, :, 3:].cpu().numpy()    # [S, 3]
 
@@ -497,8 +503,8 @@ Create or select a sequence where frames are nearly static:
 |--------|----------|-----|
 | `scale_valid_count_mean` | ~0 | Few valid frames for scale fitting |
 | `scale_mean` | ~1.0 (fallback) | Fallback kicks in |
-| `sqrt_info_trans_mean` | Lower than normal | Translation uncertainty ↑ (less confident) |
-| `sqrt_info_rot_mean` | Stable | Rotation still observable |
+| `sigma_trans_mean` | Higher than normal | Translation uncertainty ↑ (less confident) |
+| `sigma_rot_mean` | Stable | Rotation still observable |
 | No NaN/Inf | True | Robust handling |
 
 ### Test Code
@@ -516,19 +522,20 @@ def test_static_sequence_handling(model, device):
     with torch.no_grad():
         predictions = model(images)
 
-    sqrt_info = predictions['pose_sqrt_info_list'][-1]
+    log_var = predictions['pose_log_var_list'][-1]
 
     # Check no NaN/Inf
-    assert not torch.isnan(sqrt_info).any(), "NaN in sqrt_info for static sequence!"
-    assert not torch.isinf(sqrt_info).any(), "Inf in sqrt_info for static sequence!"
+    assert not torch.isnan(log_var).any(), "NaN in log_var for static sequence!"
+    assert not torch.isinf(log_var).any(), "Inf in log_var for static sequence!"
 
-    # Check translation uncertainty is higher (sqrt_info lower)
-    sqrt_info_trans = sqrt_info[..., :3].mean()
-    sqrt_info_rot = sqrt_info[..., 3:].mean()
+    # Compute sigma: σ = exp(0.5 * log_var)
+    sigma = torch.exp(0.5 * log_var)
+    sigma_trans = sigma[..., :3].mean()
+    sigma_rot = sigma[..., 3:].mean()
 
     print(f"Static sequence test:")
-    print(f"  sqrt_info_trans_mean: {sqrt_info_trans:.4f}")
-    print(f"  sqrt_info_rot_mean: {sqrt_info_rot:.4f}")
+    print(f"  sigma_trans_mean: {sigma_trans:.4f}")
+    print(f"  sigma_rot_mean: {sigma_rot:.4f}")
     print(f"  ✓ No NaN/Inf")
 ```
 
@@ -539,20 +546,20 @@ def test_static_sequence_handling(model, device):
 ### Before Training (Phase 1 - Complete)
 - [x] Unit tests pass: `python -m pytest training/tests/test_lie_algebra.py -v`
 - [x] Model loads with uncertainty head
-- [x] Forward pass produces `pose_sqrt_info_list`
+- [x] Forward pass produces `pose_log_var_list`
 - [x] Only uncertainty branch requires grad (verify_trainable_params)
 - [x] Dimension convention frozen in code (split_se3_tangent, concat_se3_tangent)
 
 ### During Training (First 100 iters) (Phase 2 - Complete)
 - [x] Loss decreases
 - [x] No NaN/Inf
-- [x] sqrt_info not stuck at clamps
+- [x] log_var clamp hit rate = 0 (no clamp collapse)
 - [x] Scale fitting healthy (scale_mean stable, not at extremes)
 - [x] Gradient norm non-zero for uncertainty head
 - [x] residual_sq_clamped_ratio < 10%
 
 ### After Training
-- [ ] Trained NLL < baseline NLL (constant sqrt_info=1)
+- [ ] Trained NLL < baseline NLL (constant log_var=0)
 - [ ] d²_rot ≈ 3, d²_trans ≈ 3
 - [ ] Uncertainty correlates with actual error (scatter plot)
 - [ ] Reliability diagram close to y=x
@@ -624,6 +631,7 @@ training:
 
 camera_nll:
   weight: 1.0
+  log_var_clamp: [-20.0, 20.0]
   residual_sq_clamp: null  # remove for full training
   # ... other params same as smoke test
 

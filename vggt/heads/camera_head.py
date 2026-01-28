@@ -70,10 +70,10 @@ class CameraHead(nn.Module):
         self.adaln_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
         self.pose_branch = Mlp(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.target_dim, drop=0)
 
-        # Uncertainty branch: outputs 6-dim RAW values for sqrt(information matrix)
+        # Log-variance branch: outputs 6-dim log(σ²) for uncertainty
         # Convention: 3 translation + 3 rotation (matching PyPose se(3) order)
-        # NOTE: No activation here! softplus + clamp is applied in loss for gradient smoothness
-        self.pose_uncertainty_branch = Mlp(
+        # log_var=0 means σ=1 (reasonable default), NLL uses: 0.5 * (r²/σ² + log(σ²))
+        self.pose_log_var_branch = Mlp(
             in_features=dim_in,
             hidden_features=dim_in // 2,
             out_features=6,  # 3 trans + 3 rot (use split_se3_tangent in loss)
@@ -90,10 +90,10 @@ class CameraHead(nn.Module):
             num_iterations (int, optional): Number of iterative refinement steps. Defaults to 4.
 
         Returns:
-            tuple: (pred_pose_enc_list, pred_sqrt_info_list)
+            tuple: (pred_pose_enc_list, pred_log_var_list)
                 - pred_pose_enc_list: List of predicted camera encodings (post-activation) from each iteration.
-                - pred_sqrt_info_list: List of raw uncertainty values (6-dim) from each iteration.
-                  These are RAW values; softplus + clamp is applied in loss.
+                - pred_log_var_list: List of log-variance values (6-dim) from each iteration.
+                  log_var = log(σ²), where σ is the uncertainty standard deviation.
         """
         # Use tokens from the last block for camera prediction.
         tokens = aggregated_tokens_list[-1]
@@ -102,8 +102,8 @@ class CameraHead(nn.Module):
         pose_tokens = tokens[:, :, 0]
         pose_tokens = self.token_norm(pose_tokens)
 
-        pred_pose_enc_list, pred_sqrt_info_list = self.trunk_fn(pose_tokens, num_iterations)
-        return pred_pose_enc_list, pred_sqrt_info_list
+        pred_pose_enc_list, pred_log_var_list = self.trunk_fn(pose_tokens, num_iterations)
+        return pred_pose_enc_list, pred_log_var_list
 
     def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int) -> tuple:
         """
@@ -114,14 +114,14 @@ class CameraHead(nn.Module):
             num_iterations (int): Number of refinement iterations.
 
         Returns:
-            tuple: (pred_pose_enc_list, pred_sqrt_info_list)
+            tuple: (pred_pose_enc_list, pred_log_var_list)
                 - pred_pose_enc_list: List of activated camera encodings from each iteration.
-                - pred_sqrt_info_list: List of raw uncertainty values (6-dim) from each iteration.
+                - pred_log_var_list: List of log-variance values (6-dim) from each iteration.
         """
         B, S, C = pose_tokens.shape
         pred_pose_enc = None
         pred_pose_enc_list = []
-        pred_sqrt_info_list = []
+        pred_log_var_list = []
 
         for _ in range(num_iterations):
             # Use a learned empty pose for the first iteration.
@@ -156,12 +156,12 @@ class CameraHead(nn.Module):
             )
             pred_pose_enc_list.append(activated_pose)
 
-            # Compute uncertainty (sqrt of diagonal information matrix)
-            # Output RAW values - no activation here! softplus + clamp done in loss
-            pred_sqrt_info_raw = self.pose_uncertainty_branch(trunk_output)
-            pred_sqrt_info_list.append(pred_sqrt_info_raw)
+            # Compute log-variance for uncertainty: log(σ²)
+            # log_var=0 means σ=1, NLL uses: 0.5 * (r²*exp(-log_var) + log_var)
+            pred_log_var = self.pose_log_var_branch(trunk_output)
+            pred_log_var_list.append(pred_log_var)
 
-        return pred_pose_enc_list, pred_sqrt_info_list
+        return pred_pose_enc_list, pred_log_var_list
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

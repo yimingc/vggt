@@ -32,11 +32,11 @@ We trained a pose uncertainty head on top of VGGT's frozen backbone and pose hea
 
 ## Training Run: 500 Iterations
 
-**WandB Run:** [uncertainty_20260127_152049](https://wandb.ai/yimingc-university-of-california-riverside/vggt-uncertainty/runs/zff3gqgb)
+**WandB Run:** [uncertainty_20260127_160118](https://wandb.ai/yimingc-university-of-california-riverside/vggt-uncertainty/runs/0gm0fh3x)
 
 ### Loss Curves
 
-![Loss Curves](figures/loss_curves.png)
+![Loss Curves](figures/sqrt_info/loss_curves.png)
 
 The NLL loss shows characteristic behavior:
 - Rapid decrease in early iterations (model learning to predict reasonable uncertainties)
@@ -45,7 +45,7 @@ The NLL loss shows characteristic behavior:
 
 ### Calibration Evolution
 
-![Calibration Metrics](figures/calibration.png)
+![Calibration Metrics](figures/sqrt_info/calibration.png)
 
 | Step | d²_rot | d²_trans | sqrt_info_rot_p90 | Status |
 |------|--------|----------|-------------------|--------|
@@ -68,7 +68,7 @@ The NLL loss shows characteristic behavior:
 
 #### A) Clamp Hit Rate
 
-![Clamp Hit Rate](figures/clamp_hit_rate.png)
+![Clamp Hit Rate](figures/sqrt_info/clamp_hit_rate.png)
 
 ```
 sqrt_info_rot_clamp_hit: 0 (rotation not hitting upper bound 200)
@@ -78,7 +78,7 @@ sqrt_info_trans_clamp_hit: 0.67 (67% of translation values at upper bound 100!)
 
 #### B) Percentile Evolution
 
-![Sqrt Info Percentiles](figures/sqrt_info_percentiles.png)
+![Sqrt Info Percentiles](figures/sqrt_info/sqrt_info_percentiles.png)
 
 ```
 sqrt_info_rot_p90: 23 → 113 (steadily increasing)
@@ -88,7 +88,7 @@ Warning sign - model is becoming increasingly confident.
 
 #### C) Residual Distribution
 
-![Residual Distribution](figures/residual_distribution.png)
+![Residual Distribution](figures/sqrt_info/residual_distribution.png)
 
 ```
 residual_rot_p90: ~0.025 rad ≈ 1.4°
@@ -98,7 +98,7 @@ Residuals are reasonable, suggesting pose predictions are decent.
 
 #### D) Scale Fitting Health
 
-![Scale Fitting](figures/scale_fitting.png)
+![Scale Fitting](figures/sqrt_info/scale_fitting.png)
 
 Scale fitting is working correctly - `pred_trans_norm_scaled_mean` closely tracks `gt_trans_norm_mean`.
 
@@ -180,21 +180,60 @@ nll_trans_weighted = nll_trans * motion_weight
 - **More diverse data**: Single TUM sequence may cause overfitting
 - **Early stopping**: Monitor d² and stop when it stabilizes around 3
 
-## Final Metrics Summary
+## Log-Variance Improvement (Implemented)
+
+Based on the analysis above, we implemented **log-variance parameterization** to fix the clamp collapse problem.
+
+### Implementation
+
+**Old (sqrt_info)**:
+```python
+sqrt_info = softplus(raw) + eps  # Can grow unboundedly toward clamp
+sqrt_info = sqrt_info.clamp(max=100)  # Hard wall, gradient = 0
+nll = 0.5 * (r² * λ - log(λ))  # where λ = sqrt_info²
+```
+
+**New (log-variance)**:
+```python
+log_var = raw  # No activation needed, naturally centered
+log_var = log_var.clamp(min=-20, max=20)  # Very loose, just for safety
+nll = 0.5 * (r² * exp(-log_var) + log_var)  # where σ = exp(0.5 * log_var)
+```
+
+### Results
+
+**WandB Run:** [uncertainty_20260127_153458](https://wandb.ai/yimingc-university-of-california-riverside/vggt-uncertainty/runs/ytdik6xv)
+
+![Sigma Evolution](figures/log_var/sigma_mean.png)
+
+![Calibration with Log-Variance](figures/log_var/calibration.png)
+
+### Key Improvements
+
+| Metric | sqrt_info (old) | log-variance (new) |
+|--------|-----------------|-------------------|
+| log_var clamp hit | 67% at max | **0%** |
+| d²_rot | 4.37 (overconfident) | **1.68** (underconfident) |
+| d²_trans | 1.16 | **3.38** (well-calibrated!) |
+| Training stability | Spikes to d²=15 | Stable oscillation |
+
+**The clamp collapse problem is solved.** No predictions hit the log_var clamp bounds.
+
+![Log-Var Clamp Hit Rate](figures/log_var/log_var_clamp_hit.png)
+
+### Final Metrics (Log-Variance)
 
 | Metric | Final Value |
 |--------|-------------|
-| `loss/pose_uncertainty_nll` | -2.18 |
-| `calibration/d2_rot_mean` | 4.37 |
-| `calibration/d2_trans_mean` | 1.16 |
-| `diagnostic/sqrt_info_rot_p90` | 107.86 |
-| `diagnostic/sqrt_info_trans_p90` | **100.0000** (at upper bound!) |
-| `diagnostic/sqrt_info_rot_clamp_hit` | 0 |
-| `diagnostic/sqrt_info_trans_clamp_hit` | **0.6667** (67% at clamp!) |
-| `diagnostic/residual_rot_p90` | 0.0271 rad |
-| `diagnostic/residual_trans_p90` | 0.0153 m |
-
-**Critical Finding:** Translation uncertainty is collapsing to the upper clamp (67% hit rate). The translation clamp collapse causes unstable d² metrics with spikes up to d²=15 during training (see step 300).
+| `loss/pose_uncertainty_nll` | -2.19 |
+| `calibration/d2_rot_mean` | 1.68 |
+| `calibration/d2_trans_mean` | 3.38 (close to target 3!) |
+| `uncertainty/sigma_rot_mean` | 0.014 rad |
+| `uncertainty/sigma_trans_mean` | 0.011 m |
+| `diagnostic/log_var_rot_at_min` | 0 |
+| `diagnostic/log_var_rot_at_max` | 0 |
+| `diagnostic/residual_rot_p90` | 0.020 rad |
+| `diagnostic/residual_trans_p90` | 0.024 m |
 
 ## Visualization Links
 
@@ -212,14 +251,14 @@ python training/tests/export_wandb_charts.py \
 
 ## Appendix: Metric Definitions
 
-### NLL Loss Formula
+### NLL Loss Formula (Log-Variance)
 ```
-L_nll = 0.5 * Σᵢ (rᵢ² * λᵢ - log(λᵢ))
+L_nll = 0.5 * Σᵢ (rᵢ² * exp(-log_var_i) + log_var_i)
 ```
 where:
 - `rᵢ` = SE(3) residual (6-dim: 3 trans + 3 rot)
-- `λᵢ` = information (inverse variance) = √λ²
-- `√λ` = sqrt_info (what the network predicts)
+- `log_var_i` = log(σ²) predicted by network
+- `σ_i` = exp(0.5 * log_var_i) = uncertainty standard deviation
 
 ### d² (Mahalanobis Distance Squared)
 ```

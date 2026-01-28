@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 
 
 def freeze_except_uncertainty(model):
-    """Freeze all parameters except pose_uncertainty_branch."""
+    """Freeze all parameters except pose_log_var_branch."""
     for name, param in model.named_parameters():
-        if 'pose_uncertainty_branch' in name:
+        if 'pose_log_var_branch' in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -195,10 +195,10 @@ def run_training(args):
         # Backward pass
         loss.backward()
 
-        # Compute gradient norm for uncertainty head
+        # Compute gradient norm for log-variance head
         grad_norm = 0.0
         for name, param in model.named_parameters():
-            if 'pose_uncertainty_branch' in name and param.grad is not None:
+            if 'pose_log_var_branch' in name and param.grad is not None:
                 grad_norm += param.grad.norm().item() ** 2
         grad_norm = grad_norm ** 0.5
 
@@ -212,9 +212,9 @@ def run_training(args):
         writer.add_scalar('loss/rot_uncertainty_nll', loss_dict['rot_uncertainty_nll'].item(), step)
         writer.add_scalar('loss/trans_uncertainty_nll', loss_dict['trans_uncertainty_nll'].item(), step)
 
-        # Uncertainty metrics
-        writer.add_scalar('uncertainty/sqrt_info_rot_mean', loss_dict['sqrt_info_rot_inv_rad_mean'].item(), step)
-        writer.add_scalar('uncertainty/sqrt_info_trans_mean', loss_dict['sqrt_info_trans_inv_meter_mean'].item(), step)
+        # Uncertainty metrics (sigma = exp(0.5 * log_var))
+        writer.add_scalar('uncertainty/sigma_rot_mean', loss_dict['sigma_rot_mean'].item(), step)
+        writer.add_scalar('uncertainty/sigma_trans_mean', loss_dict['sigma_trans_mean'].item(), step)
 
         # Calibration metrics
         writer.add_scalar('calibration/d2_rot_mean', loss_dict['d2_rot_mean'].item(), step)
@@ -232,15 +232,19 @@ def run_training(args):
         writer.add_scalar('debug/pred_trans_norm_raw_mean', loss_dict['pred_trans_norm_raw_mean'].item(), step)
         writer.add_scalar('debug/pred_trans_norm_scaled_mean', loss_dict['pred_trans_norm_scaled_mean'].item(), step)
 
-        # Diagnostic: sqrt_info percentiles (detect clamp collapse)
-        writer.add_scalar('diagnostic/sqrt_info_rot_p90', loss_dict['sqrt_info_rot_p90'].item(), step)
-        writer.add_scalar('diagnostic/sqrt_info_rot_p99', loss_dict['sqrt_info_rot_p99'].item(), step)
-        writer.add_scalar('diagnostic/sqrt_info_trans_p90', loss_dict['sqrt_info_trans_p90'].item(), step)
-        writer.add_scalar('diagnostic/sqrt_info_trans_p99', loss_dict['sqrt_info_trans_p99'].item(), step)
+        # Diagnostic: sigma percentiles (σ = exp(0.5 * log_var))
+        writer.add_scalar('diagnostic/sigma_rot_p10', loss_dict['sigma_rot_p10'].item(), step)
+        writer.add_scalar('diagnostic/sigma_rot_p50', loss_dict['sigma_rot_p50'].item(), step)
+        writer.add_scalar('diagnostic/sigma_rot_p90', loss_dict['sigma_rot_p90'].item(), step)
+        writer.add_scalar('diagnostic/sigma_trans_p10', loss_dict['sigma_trans_p10'].item(), step)
+        writer.add_scalar('diagnostic/sigma_trans_p50', loss_dict['sigma_trans_p50'].item(), step)
+        writer.add_scalar('diagnostic/sigma_trans_p90', loss_dict['sigma_trans_p90'].item(), step)
 
-        # Diagnostic: clamp hit rate (fraction at upper bound)
-        writer.add_scalar('diagnostic/sqrt_info_rot_clamp_hit', loss_dict['sqrt_info_rot_clamp_hit'].item(), step)
-        writer.add_scalar('diagnostic/sqrt_info_trans_clamp_hit', loss_dict['sqrt_info_trans_clamp_hit'].item(), step)
+        # Diagnostic: log_var clamp hit rate (should be 0 with loose clamp)
+        writer.add_scalar('diagnostic/log_var_rot_at_min', loss_dict['log_var_rot_at_min'].item(), step)
+        writer.add_scalar('diagnostic/log_var_rot_at_max', loss_dict['log_var_rot_at_max'].item(), step)
+        writer.add_scalar('diagnostic/log_var_trans_at_min', loss_dict['log_var_trans_at_min'].item(), step)
+        writer.add_scalar('diagnostic/log_var_trans_at_max', loss_dict['log_var_trans_at_max'].item(), step)
 
         # Diagnostic: residual distribution
         writer.add_scalar('diagnostic/residual_rot_p90', loss_dict['residual_rot_p90'].item(), step)
@@ -252,11 +256,11 @@ def run_training(args):
         # Log to WandB
         if use_wandb:
             wandb.log({
-                "loss/camera_nll": loss_dict['pose_uncertainty_nll'].item(),
+                "loss/pose_uncertainty_nll": loss_dict['pose_uncertainty_nll'].item(),
                 "loss/rot_uncertainty_nll": loss_dict['rot_uncertainty_nll'].item(),
                 "loss/trans_uncertainty_nll": loss_dict['trans_uncertainty_nll'].item(),
-                "uncertainty/sqrt_info_rot_mean": loss_dict['sqrt_info_rot_inv_rad_mean'].item(),
-                "uncertainty/sqrt_info_trans_mean": loss_dict['sqrt_info_trans_inv_meter_mean'].item(),
+                "uncertainty/sigma_rot_mean": loss_dict['sigma_rot_mean'].item(),
+                "uncertainty/sigma_trans_mean": loss_dict['sigma_trans_mean'].item(),
                 "calibration/d2_rot_mean": loss_dict['d2_rot_mean'].item(),
                 "calibration/d2_trans_mean": loss_dict['d2_trans_mean'].item(),
                 "scale/mean": loss_dict['scale_mean'].item(),
@@ -268,14 +272,18 @@ def run_training(args):
                 "debug/pred_trans_norm_raw_mean": loss_dict['pred_trans_norm_raw_mean'].item(),
                 "debug/pred_trans_norm_scaled_mean": loss_dict['pred_trans_norm_scaled_mean'].item(),
                 "grad/uncertainty_head_norm": grad_norm,
-                # Diagnostic: sqrt_info percentiles
-                "diagnostic/sqrt_info_rot_p90": loss_dict['sqrt_info_rot_p90'].item(),
-                "diagnostic/sqrt_info_rot_p99": loss_dict['sqrt_info_rot_p99'].item(),
-                "diagnostic/sqrt_info_trans_p90": loss_dict['sqrt_info_trans_p90'].item(),
-                "diagnostic/sqrt_info_trans_p99": loss_dict['sqrt_info_trans_p99'].item(),
-                # Diagnostic: clamp hit rate
-                "diagnostic/sqrt_info_rot_clamp_hit": loss_dict['sqrt_info_rot_clamp_hit'].item(),
-                "diagnostic/sqrt_info_trans_clamp_hit": loss_dict['sqrt_info_trans_clamp_hit'].item(),
+                # Diagnostic: sigma percentiles
+                "diagnostic/sigma_rot_p10": loss_dict['sigma_rot_p10'].item(),
+                "diagnostic/sigma_rot_p50": loss_dict['sigma_rot_p50'].item(),
+                "diagnostic/sigma_rot_p90": loss_dict['sigma_rot_p90'].item(),
+                "diagnostic/sigma_trans_p10": loss_dict['sigma_trans_p10'].item(),
+                "diagnostic/sigma_trans_p50": loss_dict['sigma_trans_p50'].item(),
+                "diagnostic/sigma_trans_p90": loss_dict['sigma_trans_p90'].item(),
+                # Diagnostic: log_var clamp hit rate
+                "diagnostic/log_var_rot_at_min": loss_dict['log_var_rot_at_min'].item(),
+                "diagnostic/log_var_rot_at_max": loss_dict['log_var_rot_at_max'].item(),
+                "diagnostic/log_var_trans_at_min": loss_dict['log_var_trans_at_min'].item(),
+                "diagnostic/log_var_trans_at_max": loss_dict['log_var_trans_at_max'].item(),
                 # Diagnostic: residual distribution
                 "diagnostic/residual_rot_p90": loss_dict['residual_rot_p90'].item(),
                 "diagnostic/residual_trans_p90": loss_dict['residual_trans_p90'].item(),

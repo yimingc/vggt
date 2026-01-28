@@ -53,16 +53,16 @@ def verify_trainable_params(model):
     # Sanity check: should be ~2.1M for uncertainty MLP
     assert total_trainable < 5_000_000, f"Too many trainable params: {total_trainable}"
     assert total_trainable > 100_000, f"Too few trainable params: {total_trainable}"
-    assert any('pose_uncertainty_branch' in name for name, _ in trainable), \
-        "pose_uncertainty_branch not in trainable params!"
+    assert any('pose_log_var_branch' in name for name, _ in trainable), \
+        "pose_log_var_branch not in trainable params!"
     print(f"\n✓ Verified: Only uncertainty head is trainable ({total_trainable:,} params)")
     return total_trainable
 
 
 def freeze_except_uncertainty(model):
-    """Freeze all parameters except pose_uncertainty_branch."""
+    """Freeze all parameters except pose_log_var_branch."""
     for name, param in model.named_parameters():
-        if 'pose_uncertainty_branch' in name:
+        if 'pose_log_var_branch' in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -206,8 +206,8 @@ def run_smoke_test(args):
             'loss': loss_val,
             'rot_uncertainty_nll': loss_dict['rot_uncertainty_nll'].item(),
             'trans_uncertainty_nll': loss_dict['trans_uncertainty_nll'].item(),
-            'sqrt_info_rot_inv_rad_mean': loss_dict['sqrt_info_rot_inv_rad_mean'].item(),
-            'sqrt_info_trans_inv_meter_mean': loss_dict['sqrt_info_trans_inv_meter_mean'].item(),
+            'sigma_rot_mean': loss_dict['sigma_rot_mean'].item(),
+            'sigma_trans_mean': loss_dict['sigma_trans_mean'].item(),
             'd2_rot_mean': loss_dict['d2_rot_mean'].item(),
             'd2_trans_mean': loss_dict['d2_trans_mean'].item(),
             'scale_mean': loss_dict['scale_mean'].item(),
@@ -274,15 +274,15 @@ def run_smoke_test(args):
     if any_nan:
         success = False
 
-    # Check 3: sqrt_info not stuck at clamps
-    final_sqrt_info_rot = metrics_history[-1]['sqrt_info_rot_inv_rad_mean']
-    final_sqrt_info_trans = metrics_history[-1]['sqrt_info_trans_inv_meter_mean']
-    rot_at_clamp = final_sqrt_info_rot <= 0.11 or final_sqrt_info_rot >= 199
-    trans_at_clamp = final_sqrt_info_trans <= 0.11 or final_sqrt_info_trans >= 99
-    print(f"✓ sqrt_info_rot_inv_rad: {final_sqrt_info_rot:.2f} "
-          f"({'at clamp ✗' if rot_at_clamp else 'OK ✓'})")
-    print(f"✓ sqrt_info_trans_inv_meter: {final_sqrt_info_trans:.2f} "
-          f"({'at clamp ✗' if trans_at_clamp else 'OK ✓'})")
+    # Check 3: sigma values reasonable (not collapsed to extreme)
+    final_sigma_rot = metrics_history[-1]['sigma_rot_mean']
+    final_sigma_trans = metrics_history[-1]['sigma_trans_mean']
+    rot_extreme = final_sigma_rot < 1e-5 or final_sigma_rot > 1e5
+    trans_extreme = final_sigma_trans < 1e-5 or final_sigma_trans > 1e5
+    print(f"✓ sigma_rot: {final_sigma_rot:.4f} rad "
+          f"({'extreme ✗' if rot_extreme else 'OK ✓'})")
+    print(f"✓ sigma_trans: {final_sigma_trans:.4f} m "
+          f"({'extreme ✗' if trans_extreme else 'OK ✓'})")
 
     # Check 4: Scale stable
     final_scale = metrics_history[-1]['scale_mean']

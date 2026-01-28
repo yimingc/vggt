@@ -66,8 +66,8 @@ class MultitaskLoss(torch.nn.Module):
             total_loss = total_loss + camera_loss
             loss_dict.update(camera_loss_dict)
 
-        # Camera NLL loss for uncertainty - if sqrt_info is predicted and config provided
-        if "pose_sqrt_info_list" in predictions and self.camera_nll is not None:
+        # Camera NLL loss for uncertainty - if log_var is predicted and config provided
+        if "pose_log_var_list" in predictions and self.camera_nll is not None:
             nll_loss_dict = compute_camera_nll_loss(predictions, batch, **self.camera_nll)
             nll_loss = nll_loss_dict["pose_uncertainty_nll"] * self.camera_nll["weight"]
             total_loss = total_loss + nll_loss
@@ -179,42 +179,47 @@ def compute_camera_nll_loss(
     batch_data,
     pose_encoding_type="absT_quaR_FoV",
     gamma=0.6,
-    sqrt_info_rot_inv_rad_clamp=(0.1, 200.0),
-    sqrt_info_trans_inv_meter_clamp=(0.1, 100.0),  # tighter for stability
+    log_var_clamp=(-20.0, 20.0),  # loose clamp on log(σ²)
     residual_sq_clamp=None,  # set to e.g. 100.0 for smoke test only
     scale_detach=True,  # detach scale to avoid cheating channel
     min_translation=0.02,  # filter near-stationary frames (2cm)
-    eps=1e-6,  # for log stability
+    eps=1e-6,  # for numerical stability
     **kwargs
 ):
     """
-    NLL loss for pose uncertainty in se(3) space.
+    NLL loss for pose uncertainty in se(3) space using log-variance parameterization.
 
     Pipeline:
     1. Convert GT/Pred to window-relative poses (relative to frame 0)
     2. Fit per-window scale using relative translations
     3. Compute SE(3) residual: r = Log(inv(T_rel_gt) @ T_rel_pred)
-    4. NLL loss with diagonal information matrix
+    4. NLL loss with log-variance parameterization
 
-    L = 0.5 * sum_i (r_i^2 * lambda_i - log(lambda_i))
+    L = 0.5 * sum_i (r_i^2 * exp(-log_var_i) + log_var_i)
+
+    where log_var = log(σ²), so σ = exp(0.5 * log_var)
+
+    Advantages of log-variance over sqrt_info:
+    - Naturally centered: log_var=0 means σ=1
+    - Symmetric gradients in both directions
+    - No hard clamp collapse issue
 
     Args:
-        pred_dict: predictions dict, contains 'pose_enc_list' and 'pose_sqrt_info_list'
+        pred_dict: predictions dict, contains 'pose_enc_list' and 'pose_log_var_list'
         batch_data: ground truth batch dict with 'extrinsics', 'intrinsics', 'images'
         pose_encoding_type: type of pose encoding (default: "absT_quaR_FoV")
         gamma: temporal decay weight for multi-stage training
-        sqrt_info_rot_inv_rad_clamp: (min, max) clamp for rotation sqrt(info) [rad⁻¹]
-        sqrt_info_trans_inv_meter_clamp: (min, max) clamp for translation sqrt(info) [m⁻¹]
+        log_var_clamp: (min, max) clamp for log(σ²), very loose
         residual_sq_clamp: clamp for residual^2 (None to disable, for smoke test)
         scale_detach: whether to detach scale (prevents cheating channel)
         min_translation: threshold for filtering static frames in scale fitting
-        eps: epsilon for log stability
+        eps: epsilon for numerical stability
 
     Returns:
         dict with 'pose_uncertainty_nll' and various logging metrics
     """
     pred_pose_encodings = pred_dict['pose_enc_list']
-    pred_sqrt_info_list = pred_dict['pose_sqrt_info_list']
+    pred_log_var_list = pred_dict['pose_log_var_list']
     n_stages = len(pred_pose_encodings)
 
     # Get GT pose encoding
@@ -240,15 +245,15 @@ def compute_camera_nll_loss(
     # Variables to save for logging (last stage)
     residual_sq_last = None
     residual_sq_raw_last = None  # Before clamping, for clamped ratio
-    lambda_diag_last = None
-    sqrt_info_last = None
+    log_var_last = None
+    sigma_last = None
     scale_last = None
     valid_count_last = None
 
     for stage_idx in range(n_stages):
         stage_weight = gamma ** (n_stages - stage_idx - 1)
         pred_pose_enc = pred_pose_encodings[stage_idx]  # [B, S, 9]
-        sqrt_info_raw = pred_sqrt_info_list[stage_idx]   # [B, S, 6]
+        log_var_raw = pred_log_var_list[stage_idx]       # [B, S, 6]
 
         # Step 2: Convert Pred to SE3 and compute window-relative poses
         T_cam_world_pred = pose_encoding_to_se3(pred_pose_enc)  # pp.SE3 [B, S]
@@ -273,30 +278,22 @@ def compute_camera_nll_loss(
 
         # Step 6: Skip frame 0 (identity, residual=0)
         residual = residual[:, 1:]          # [B, S-1, 6]
-        sqrt_info_frame = sqrt_info_raw[:, 1:]  # [B, S-1, 6]
+        log_var_frame = log_var_raw[:, 1:]  # [B, S-1, 6]
 
-        # Step 7: SOFTPLUS + CLAMP for stable positive sqrt_info
-        # softplus ensures positive, clamp is just safety rail
-        sqrt_info_positive = F.softplus(sqrt_info_frame) + eps  # Always positive!
+        # Step 7: Clamp log_var (very loose bounds, just for numerical safety)
+        # log_var = log(σ²), so σ = exp(0.5 * log_var)
+        # log_var = -20 means σ ≈ 4.5e-5 (very confident)
+        # log_var = 20 means σ ≈ 22000 (very uncertain)
+        log_var_clamped = log_var_frame.clamp(min=log_var_clamp[0], max=log_var_clamp[1])
 
-        # Split into translation and rotation components using convention function
-        sqrt_info_trans_inv_meter, sqrt_info_rot_inv_rad = split_se3_tangent(sqrt_info_positive)
-        sqrt_info_trans_inv_meter = sqrt_info_trans_inv_meter.clamp(
-            min=sqrt_info_trans_inv_meter_clamp[0], max=sqrt_info_trans_inv_meter_clamp[1]
-        )
-        sqrt_info_rot_inv_rad = sqrt_info_rot_inv_rad.clamp(
-            min=sqrt_info_rot_inv_rad_clamp[0], max=sqrt_info_rot_inv_rad_clamp[1]
-        )
-        sqrt_info_clamped = concat_se3_tangent(sqrt_info_trans_inv_meter, sqrt_info_rot_inv_rad)
-
-        # Step 8: NLL loss
+        # Step 8: NLL loss using log-variance parameterization
+        # NLL = 0.5 * (r² / σ² + log(σ²)) = 0.5 * (r² * exp(-log_var) + log_var)
         residual_sq_raw = residual ** 2
         if residual_sq_clamp is not None:
             residual_sq = residual_sq_raw.clamp(max=residual_sq_clamp)  # Only for smoke test
         else:
             residual_sq = residual_sq_raw
-        lambda_diag = sqrt_info_clamped ** 2
-        nll = 0.5 * (residual_sq * lambda_diag - 2 * torch.log(sqrt_info_clamped + eps))
+        nll = 0.5 * (residual_sq * torch.exp(-log_var_clamped) + log_var_clamped)
 
         total_nll += stage_weight * nll.mean()
 
@@ -304,8 +301,9 @@ def compute_camera_nll_loss(
         if stage_idx == n_stages - 1:
             residual_sq_last = residual_sq
             residual_sq_raw_last = residual_sq_raw
-            lambda_diag_last = lambda_diag
-            sqrt_info_last = sqrt_info_clamped
+            log_var_last = log_var_clamped
+            # Compute sigma for logging: σ = exp(0.5 * log_var)
+            sigma_last = torch.exp(0.5 * log_var_clamped)
             scale_last = scale
             # Compute valid_count for scale fitting health
             # Use camera positions (same as scale fitting)
@@ -330,15 +328,17 @@ def compute_camera_nll_loss(
     # Compute separate rot/trans NLL for logging (last stage only)
     # Split using convention function for consistency
     rsq_trans, rsq_rot = split_se3_tangent(residual_sq_last)
-    lam_trans, lam_rot = split_se3_tangent(lambda_diag_last)
-    si_trans, si_rot = split_se3_tangent(sqrt_info_last)
+    lv_trans, lv_rot = split_se3_tangent(log_var_last)
+    sig_trans, sig_rot = split_se3_tangent(sigma_last)
 
-    nll_trans = 0.5 * (rsq_trans * lam_trans - 2 * torch.log(si_trans + eps))
-    nll_rot = 0.5 * (rsq_rot * lam_rot - 2 * torch.log(si_rot + eps))
+    # NLL with log-variance: 0.5 * (r²/σ² + log(σ²)) = 0.5 * (r² * exp(-log_var) + log_var)
+    nll_trans = 0.5 * (rsq_trans * torch.exp(-lv_trans) + lv_trans)
+    nll_rot = 0.5 * (rsq_rot * torch.exp(-lv_rot) + lv_rot)
 
-    # Calibration statistics: d^2 = sum_k lambda_k r_k^2 (expect 3 for rot, 3 for trans)
-    d2_trans = (rsq_trans * lam_trans).sum(dim=-1)  # [B, S-1]
-    d2_rot = (rsq_rot * lam_rot).sum(dim=-1)        # [B, S-1]
+    # Calibration statistics: d² = sum_k (r_k² / σ_k²) = sum_k r_k² * exp(-log_var_k)
+    # Expect 3 for rot (3 DOF), 3 for trans (3 DOF)
+    d2_trans = (rsq_trans * torch.exp(-lv_trans)).sum(dim=-1)  # [B, S-1]
+    d2_rot = (rsq_rot * torch.exp(-lv_rot)).sum(dim=-1)        # [B, S-1]
 
     # Compute residual_sq clamped ratio (fraction of values that hit the clamp)
     # This detects if clamping is distorting the loss signal
@@ -352,24 +352,27 @@ def compute_camera_nll_loss(
     scale_at_min = (scale_last <= 0.01 + 1e-6).float().mean().detach()
     scale_at_max = (scale_last >= 100.0 - 1e-6).float().mean().detach()
 
-    # === NEW: Diagnostic metrics for overconfidence detection ===
-    # A) sqrt_info percentiles and clamp hit rate
+    # === Diagnostic metrics for calibration and clamp detection ===
+    # A) Sigma percentiles and log_var clamp hit rate
     # Flatten for percentile computation: [B, S-1, 3] -> [B*(S-1)*3]
-    si_rot_flat = si_rot.reshape(-1)
-    si_trans_flat = si_trans.reshape(-1)
+    sig_rot_flat = sig_rot.reshape(-1)
+    sig_trans_flat = sig_trans.reshape(-1)
+    lv_rot_flat = lv_rot.reshape(-1)
+    lv_trans_flat = lv_trans.reshape(-1)
 
-    # Percentiles (p90, p99)
-    sqrt_info_rot_p90 = torch.quantile(si_rot_flat, 0.90).detach()
-    sqrt_info_rot_p99 = torch.quantile(si_rot_flat, 0.99).detach()
-    sqrt_info_trans_p90 = torch.quantile(si_trans_flat, 0.90).detach()
-    sqrt_info_trans_p99 = torch.quantile(si_trans_flat, 0.99).detach()
+    # Sigma percentiles (p10, p50, p90)
+    sigma_rot_p10 = torch.quantile(sig_rot_flat, 0.10).detach()
+    sigma_rot_p50 = torch.quantile(sig_rot_flat, 0.50).detach()
+    sigma_rot_p90 = torch.quantile(sig_rot_flat, 0.90).detach()
+    sigma_trans_p10 = torch.quantile(sig_trans_flat, 0.10).detach()
+    sigma_trans_p50 = torch.quantile(sig_trans_flat, 0.50).detach()
+    sigma_trans_p90 = torch.quantile(sig_trans_flat, 0.90).detach()
 
-    # Clamp hit rate (fraction hitting upper bound)
-    # Use the clamp bounds from function args
-    sqrt_info_rot_upper = sqrt_info_rot_inv_rad_clamp[1]
-    sqrt_info_trans_upper = sqrt_info_trans_inv_meter_clamp[1]
-    sqrt_info_rot_clamp_hit = (si_rot >= sqrt_info_rot_upper - 1e-3).float().mean().detach()
-    sqrt_info_trans_clamp_hit = (si_trans >= sqrt_info_trans_upper - 1e-3).float().mean().detach()
+    # Log-var clamp hit rate (should be near 0 with log-variance)
+    log_var_at_min = (lv_rot_flat <= log_var_clamp[0] + 0.1).float().mean().detach()
+    log_var_at_max = (lv_rot_flat >= log_var_clamp[1] - 0.1).float().mean().detach()
+    log_var_trans_at_min = (lv_trans_flat <= log_var_clamp[0] + 0.1).float().mean().detach()
+    log_var_trans_at_max = (lv_trans_flat >= log_var_clamp[1] - 0.1).float().mean().detach()
 
     # B) Residual distribution (rot/trans p90)
     # residual is [B, S-1, 6], split into trans[:3] and rot[3:]
@@ -387,8 +390,8 @@ def compute_camera_nll_loss(
         # For TensorBoard logging:
         "rot_uncertainty_nll": nll_rot.mean().detach(),
         "trans_uncertainty_nll": nll_trans.mean().detach(),
-        "sqrt_info_rot_inv_rad_mean": si_rot.mean().detach(),
-        "sqrt_info_trans_inv_meter_mean": si_trans.mean().detach(),
+        "sigma_rot_mean": sig_rot.mean().detach(),  # σ in radians
+        "sigma_trans_mean": sig_trans.mean().detach(),  # σ in meters
         "d2_rot_mean": d2_rot.mean().detach(),    # expect ~3 if calibrated
         "d2_trans_mean": d2_trans.mean().detach(), # expect ~3 if calibrated
         # Scale fitting health metrics
@@ -407,15 +410,19 @@ def compute_camera_nll_loss(
         "scale_numerator": scale_numerator_last.mean().detach(),  # negative = opposite direction
         "scale_denominator": scale_denominator_last.mean().detach(),
         "scale_raw": scale_raw_last.mean().detach(),  # before clamping
-        # Diagnostic: sqrt_info percentiles (detect clamp collapse)
-        "sqrt_info_rot_p90": sqrt_info_rot_p90,
-        "sqrt_info_rot_p99": sqrt_info_rot_p99,
-        "sqrt_info_trans_p90": sqrt_info_trans_p90,
-        "sqrt_info_trans_p99": sqrt_info_trans_p99,
-        # Diagnostic: clamp hit rate (fraction at upper bound)
-        "sqrt_info_rot_clamp_hit": sqrt_info_rot_clamp_hit,
-        "sqrt_info_trans_clamp_hit": sqrt_info_trans_clamp_hit,
-        # Diagnostic: residual distribution (detect if r is large while λ is high)
+        # Diagnostic: sigma percentiles (σ = exp(0.5 * log_var))
+        "sigma_rot_p10": sigma_rot_p10,  # radians
+        "sigma_rot_p50": sigma_rot_p50,
+        "sigma_rot_p90": sigma_rot_p90,
+        "sigma_trans_p10": sigma_trans_p10,  # meters
+        "sigma_trans_p50": sigma_trans_p50,
+        "sigma_trans_p90": sigma_trans_p90,
+        # Diagnostic: log_var clamp hit rate (should be 0 with loose clamp)
+        "log_var_rot_at_min": log_var_at_min,
+        "log_var_rot_at_max": log_var_at_max,
+        "log_var_trans_at_min": log_var_trans_at_min,
+        "log_var_trans_at_max": log_var_trans_at_max,
+        # Diagnostic: residual distribution
         "residual_rot_p90": residual_rot_p90,  # radians
         "residual_trans_p90": residual_trans_p90,  # meters
     }

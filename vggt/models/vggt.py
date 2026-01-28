@@ -64,10 +64,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
-                pose_enc_list, pose_sqrt_info_list = self.camera_head(aggregated_tokens_list)
+                pose_enc_list, pose_log_var_list = self.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
                 predictions["pose_enc_list"] = pose_enc_list
-                predictions["pose_sqrt_info_list"] = pose_sqrt_info_list  # uncertainty per iteration
+                predictions["pose_log_var_list"] = pose_log_var_list  # uncertainty log-variance per iteration
                 
             if self.depth_head is not None:
                 depth, depth_conf = self.depth_head(
