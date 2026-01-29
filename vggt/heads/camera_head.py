@@ -100,6 +100,8 @@ class CameraHead(nn.Module):
 
         # Extract the camera tokens
         pose_tokens = tokens[:, :, 0]
+        # Explicitly cast to float32 for layer_norm (tokens may be bfloat16 from autocast)
+        pose_tokens = pose_tokens.float()
         pose_tokens = self.token_norm(pose_tokens)
 
         pred_pose_enc_list, pred_log_var_list = self.trunk_fn(pose_tokens, num_iterations)
