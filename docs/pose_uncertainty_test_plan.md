@@ -28,6 +28,16 @@ This document outlines the test plan for verifying the pose uncertainty head imp
   - [5.1 Extend eval_vggt_tum.py](#51-extend-eval_vggt_tumpy)
   - [5.2 Run Full Evaluation](#52-run-full-evaluation)
 - [Phase 5.5: Failure Mode Test (Static Sequence)](#phase-55-failure-mode-test-static-sequence)
+- [Phase 5.9: PGO Evaluation](#phase-59-pgo-evaluation-uncertainty-value-in-optimization)
+  - [5.9.0 Critical Sanity Tests](#590-critical-sanity-tests-run-first)
+  - [5.9.1 Overview](#591-overview)
+  - [5.9.2 Window Sampling](#592-window-sampling-50-overlap)
+  - [5.9.3 Edge Generation](#593-edge-generation-per-window)
+  - [5.9.4 Global Pose Initialization](#594-global-pose-initialization-mst-based)
+  - [5.9.5 PGO Formulation](#595-pgo-formulation)
+  - [5.9.6 Evaluation Metrics](#596-evaluation-metrics)
+  - [5.9.7 Implementation Steps](#597-implementation-steps)
+  - [5.9.8 Success Criteria](#598-success-criteria)
 - [Quick Test Checklist](#quick-test-checklist)
 - [Expected Timeline](#expected-timeline)
 - [Phase 6: Scale to Full TUM RGB-D](#phase-6-scale-to-full-tum-rgb-d)
@@ -679,6 +689,631 @@ Static sequence test:
 
 ---
 
+## Phase 5.9: PGO Evaluation (Uncertainty Value in Optimization)
+
+**Purpose:** Prove that learned uncertainty improves pose graph optimization, not just achieves calibration metrics.
+
+**Key Question:** Does weighting edges by predicted uncertainty yield better global poses than uniform weighting?
+
+### 5.9.0 Critical Sanity Tests (Run First!)
+
+Before running full PGO, verify two things that can silently invalidate results:
+
+#### Sanity Test A: Theseus Residual Dimension Order
+
+Our training uses PyPose `Log()` which returns `[vx,vy,vz, wx,wy,wz]` (trans first, rot second).
+Theseus may use a different order. **Must verify before proceeding.**
+
+```python
+import theseus as th
+import torch
+import numpy as np
+
+def test_theseus_residual_order():
+    """
+    Verify Theseus Between residual dimension order.
+
+    Test BOTH pure-translation AND pure-rotation to fully confirm.
+    """
+    X_i = th.SE3(tensor=torch.eye(4).unsqueeze(0))
+    X_j = th.SE3(tensor=torch.eye(4).unsqueeze(0))
+
+    # Test 1: Pure translation [1, 0, 0]
+    Z_trans = torch.eye(4).unsqueeze(0)
+    Z_trans[0, 0, 3] = 1.0  # tx = 1
+    measurement_trans = th.SE3(tensor=Z_trans)
+    cost_trans = th.eb.Between(X_i, X_j, measurement_trans, th.ScaleCostWeight(1.0))
+    r_trans = cost_trans.error().squeeze()  # [6]
+
+    # Test 2: Pure rotation (10° around z-axis)
+    angle = np.radians(10)
+    R_z = torch.tensor([
+        [np.cos(angle), -np.sin(angle), 0],
+        [np.sin(angle),  np.cos(angle), 0],
+        [0, 0, 1]
+    ], dtype=torch.float32)
+    Z_rot = torch.eye(4).unsqueeze(0)
+    Z_rot[0, :3, :3] = R_z
+    measurement_rot = th.SE3(tensor=Z_rot)
+    cost_rot = th.eb.Between(X_i, X_j, measurement_rot, th.ScaleCostWeight(1.0))
+    r_rot = cost_rot.error().squeeze()  # [6]
+
+    print("Sanity Test A: Theseus Residual Dimension Order")
+    print("=" * 50)
+    print(f"Pure translation residual: {r_trans.tolist()}")
+    print(f"  [:3] norm: {r_trans[:3].norm():.4f}")
+    print(f"  [3:] norm: {r_trans[3:].norm():.4f}")
+    print(f"Pure rotation residual: {r_rot.tolist()}")
+    print(f"  [:3] norm: {r_rot[:3].norm():.4f}")
+    print(f"  [3:] norm: {r_rot[3:].norm():.4f}")
+
+    # Determine order
+    trans_in_first3 = r_trans[:3].norm() > r_trans[3:].norm()
+    rot_in_last3 = r_rot[3:].norm() > r_rot[:3].norm()
+
+    if trans_in_first3 and rot_in_last3:
+        print("\n✓ Theseus uses [trans, rot] order - matches PyPose")
+        return "trans_rot"
+    elif not trans_in_first3 and not rot_in_last3:
+        print("\n✗ Theseus uses [rot, trans] order")
+        print("  → MUST swap: log_var_theseus = torch.cat([log_var[3:], log_var[:3]], dim=-1)")
+        return "rot_trans"
+    else:
+        print(f"\n? Inconsistent results - investigate manually!")
+        return "unknown"
+
+# Run this BEFORE any PGO experiments!
+```
+
+#### Sanity Test B: DiagonalCostWeight Semantics (√Λ vs Λ)
+
+Many optimization libraries expect **√Λ** (sqrt of information), not Λ itself.
+If we pass Λ when it expects √Λ, the objective becomes r^T Λ² r instead of r^T Λ r.
+
+```python
+def test_weight_semantics():
+    """
+    Verify whether DiagonalCostWeight expects √Λ or Λ.
+
+    Strategy: Test both hypotheses and see which one matches Theseus output.
+    """
+    import theseus as th
+    import torch
+
+    X_i = th.SE3(tensor=torch.eye(4).unsqueeze(0))
+    X_j = th.SE3(tensor=torch.eye(4).unsqueeze(0))
+
+    Z = torch.eye(4).unsqueeze(0)
+    Z[0, 0, 3] = 0.1  # Small translation
+    measurement = th.SE3(tensor=Z)
+
+    # Our "intended" information matrix: Λ = diag([4, 4, 4, 1, 1, 1])
+    lambda_diag = torch.tensor([[4.0, 4.0, 4.0, 1.0, 1.0, 1.0]])
+
+    # Pass lambda_diag to Theseus
+    weight = th.eb.DiagonalCostWeight(lambda_diag)
+    cost = th.eb.Between(X_i, X_j, measurement, weight)
+    r = cost.error().squeeze()  # [6]
+
+    objective = th.Objective()
+    objective.add(cost)
+    theseus_obj = objective.error_squared_norm().item()
+
+    # Hypothesis 1: Theseus expects Λ → objective = r^T Λ r
+    hyp1_obj = (r ** 2 * lambda_diag.squeeze()).sum().item()
+
+    # Hypothesis 2: Theseus expects √Λ → objective = r^T Λ² r = r^T (w^2) r where w=input
+    # i.e., what we passed (lambda_diag) gets squared internally
+    hyp2_obj = (r ** 2 * (lambda_diag.squeeze() ** 2)).sum().item()
+
+    print("Sanity Test B: DiagonalCostWeight Semantics")
+    print("=" * 50)
+    print(f"Residual r: {r.tolist()}")
+    print(f"Input weight w: {lambda_diag.squeeze().tolist()}")
+    print(f"Theseus objective:        {theseus_obj:.6f}")
+    print(f"Hypothesis 1 (w=Λ):       {hyp1_obj:.6f}  (r^T Λ r)")
+    print(f"Hypothesis 2 (w=√Λ):      {hyp2_obj:.6f}  (r^T Λ² r)")
+
+    # Check which hypothesis matches
+    err1 = abs(theseus_obj - hyp1_obj) / (theseus_obj + 1e-12)
+    err2 = abs(theseus_obj - hyp2_obj) / (theseus_obj + 1e-12)
+
+    if err1 < 0.01:
+        print("\n✓ DiagonalCostWeight expects Λ (information matrix)")
+        print("  → Use: weight = DiagonalCostWeight(torch.exp(-log_var))")
+        return "lambda"
+    elif err2 < 0.01:
+        print("\n✓ DiagonalCostWeight expects √Λ (sqrt information)")
+        print("  → Use: weight = DiagonalCostWeight(torch.exp(-0.5 * log_var))")
+        return "sqrt_lambda"
+    else:
+        print(f"\n? Neither hypothesis matches (err1={err1:.2%}, err2={err2:.2%})")
+        print("  → Investigate Theseus source code manually")
+        return "unknown"
+
+# Run this BEFORE any PGO experiments!
+```
+
+**Action based on results:**
+- If Test A returns "rot_trans": swap `log_var[:, :3]` and `log_var[:, 3:]` when creating edges
+- If Test B returns "sqrt_lambda": use `torch.exp(-0.5 * log_var)` instead of `torch.exp(-log_var)`
+
+**Store result as global config:**
+```python
+# Set these based on sanity test results (run once, then hardcode)
+THESEUS_ORDER = "trans_rot"  # or "rot_trans"
+THESEUS_WEIGHT = "lambda"    # or "sqrt_lambda"
+```
+
+### 5.9.1 Overview
+
+Use overlapping windows to generate redundant pose graph edges, then run global PGO:
+- **Uniform weights**: Λ = I for all edges (weak baseline)
+- **Homoscedastic MLE weights**: Λ = diag(exp(-log_var_mle)) with global constant σ (strong baseline)
+- **Heteroscedastic weights**: Λ = diag(exp(-log_var(x))) from uncertainty head (ours)
+
+**Why three baselines?**
+The homoscedastic MLE baseline answers a critical question:
+> "Is improvement from learning input-dependent uncertainty, or just from tuning a global weight?"
+
+If heteroscedastic only beats uniform but not MLE → we just learned a better constant, not useful per-sample uncertainty.
+
+If uncertainty is useful, predicted weights should:
+1. Down-weight unreliable edges (high motion blur, occlusion, etc.)
+2. Produce lower ATE/RPE after optimization than both baselines
+
+### 5.9.2 Window Sampling (50% Overlap)
+
+```python
+# Parameters
+S = 8           # Window size (frames)
+stride = S // 2  # 50% overlap = stride of 4
+
+# Window anchors: 0, 4, 8, 12, ...
+# Window 0: frames [0, 1, 2, 3, 4, 5, 6, 7]
+# Window 1: frames [4, 5, 6, 7, 8, 9, 10, 11]
+# ...
+# Overlap creates redundant constraints on frames 4-7, 8-11, etc.
+```
+
+### 5.9.3 Edge Generation (Per Window)
+
+For each window starting at anchor `a` with frames `[a, a+1, ..., a+S-1]`:
+
+**Important: log_var Scale Semantics**
+
+Our training (Phase 3/4) supervises `log_var` against **metric residuals** (after scale fitting).
+Therefore, `log_var` is already in metric units and does NOT need scale transformation.
+
+> If your training used pre-scale residuals, you would need:
+> `log_var_trans_metric = log_var_trans + 2*log(scale)`
+> But this is NOT the case for us.
+
+```python
+# Step 1: Run VGGT on window
+predictions = model(images[a:a+S])
+pose_enc = predictions['pose_enc_list'][-1]      # [1, S, 9]
+log_var = predictions['pose_log_var_list'][-1]   # [1, S, 6]
+
+# Step 2: Convert to SE(3) matrices and compute window-relative poses
+T_abs = pose_encoding_to_se3(pose_enc)           # [S, 4, 4] matrices
+T_anchor_inv = torch.inverse(T_abs[0])           # [4, 4]
+T_rel = T_anchor_inv @ T_abs                     # [S, 4, 4]: T_a^{-1} @ T_{a+i}
+
+# Step 3: Fit per-window scale using GT (oracle metric scale for eval)
+scale = fit_scale_with_gt(T_rel, gt_poses[a:a+S])
+T_rel_scaled = apply_scale(T_rel, scale)         # [S, 4, 4]
+
+# Sanity check: log_var should be reasonable relative to scale
+sigma_trans = torch.exp(0.5 * log_var[0, :, :3]).mean()
+print(f"Window {a}: scale={scale:.3f}, σ_trans={sigma_trans:.4f}m")
+# If σ_trans >> scale or σ_trans << 0.001, something is wrong
+
+# Step 4: Create star-graph edges (anchor → each frame)
+# Adjust based on Sanity Test A/B results!
+for i in range(1, S):
+    global_idx = a + i
+
+    # Measurement (already metric-scaled)
+    Z = T_rel_scaled[i]                          # [4, 4]
+
+    # Information matrix - adjust based on Sanity Test B!
+    if THESEUS_WEIGHT == "lambda":
+        info = torch.exp(-log_var[0, i])         # [6] = Λ
+    else:  # "sqrt_lambda"
+        info = torch.exp(-0.5 * log_var[0, i])   # [6] = √Λ
+
+    # Dimension order - adjust based on Sanity Test A!
+    if THESEUS_ORDER == "rot_trans":
+        info = torch.cat([info[3:], info[:3]])   # Swap trans/rot
+
+    edges.append({
+        'from': a,
+        'to': global_idx,
+        'measurement': Z,                        # [4, 4] SE(3)
+        'information': info,                     # [6] (Λ or √Λ based on test)
+    })
+```
+
+**Edge Semantics (Star Graph):**
+- Each edge is `(anchor, target, Z_{anchor→target}, λ)`
+- Consistent with training: uncertainty is for "frame relative to window anchor"
+- Overlapping windows create multiple constraints on same node pairs
+
+### 5.9.4 Global Pose Initialization (MST-based)
+
+```python
+import theseus as th
+import networkx as nx
+import torch
+from collections import defaultdict
+
+def initialize_poses_mst(edges, num_nodes):
+    """
+    Initialize global poses using MST traversal.
+
+    Why MST?
+    - Ensures connected graph (no isolated nodes)
+    - Single path between any two nodes (no conflicts)
+    - Weighted MST can prefer high-confidence edges
+
+    Returns:
+        Dict {node_id: SE3 tensor [4, 4]}
+    """
+    # Step 1: For duplicate (u,v) pairs, keep only the BEST edge (lowest weight = highest info)
+    # nx.Graph() would silently overwrite duplicates with the LAST one - this is wrong!
+    best_edges = {}  # (min(u,v), max(u,v)) -> edge with lowest weight
+    for e in edges:
+        u, v = e['from'], e['to']
+        key = (min(u, v), max(u, v))  # Canonical undirected key
+        weight = 1.0 / (e['information'].sum().item() + 1e-6)
+
+        if key not in best_edges or weight < best_edges[key]['weight']:
+            best_edges[key] = {
+                'weight': weight,
+                'src': u,
+                'dst': v,
+                'Z_fwd': e['measurement'],
+                'Z_inv': torch.inverse(e['measurement']),
+            }
+
+    print(f"MST init: {len(edges)} edges → {len(best_edges)} unique pairs (kept best)")
+
+    # Step 2: Build graph from best edges only
+    G = nx.Graph()
+    for (u, v), data in best_edges.items():
+        G.add_edge(u, v, **data)
+
+    # Step 3: Check connectivity from node 0
+    if not nx.is_connected(G):
+        components = list(nx.connected_components(G))
+        print(f"⚠️ WARNING: Graph has {len(components)} connected components!")
+        print(f"  Component sizes: {[len(c) for c in components]}")
+        # Find which component contains node 0
+        for i, comp in enumerate(components):
+            if 0 in comp:
+                print(f"  Using component {i} containing node 0 ({len(comp)} nodes)")
+                G = G.subgraph(comp).copy()
+                break
+
+    # Step 4: Compute MST
+    mst = nx.minimum_spanning_tree(G)
+
+    # Step 5: BFS from node 0 to initialize all poses
+    poses = {0: torch.eye(4)}  # X_0 = Identity (gauge fix)
+
+    for parent, child in nx.bfs_edges(mst, source=0):
+        edge_data = mst.edges[parent, child]
+
+        # Determine correct transform based on original edge direction
+        if parent == edge_data['src'] and child == edge_data['dst']:
+            # BFS direction matches original edge: X_child = X_parent @ Z_fwd
+            poses[child] = poses[parent] @ edge_data['Z_fwd']
+        else:
+            # BFS direction is reversed: X_child = X_parent @ Z_inv
+            poses[child] = poses[parent] @ edge_data['Z_inv']
+
+    return poses
+```
+
+**Key fixes:**
+1. **Duplicate edge handling**: For each (u,v) pair, keep only the edge with highest information (lowest weight). `nx.Graph()` would silently overwrite with the *last* edge - now we keep the *best*.
+2. **Connectivity check**: Warns if graph is disconnected and uses the component containing node 0.
+3. **Direction tracking**: Stores `src`, `dst`, `Z_fwd`, `Z_inv` to correctly apply transforms during BFS.
+
+### 5.9.5 PGO Formulation
+
+**Cost Function:**
+```
+E(X) = Σ_edges || r_e ||²_{Λ_e}
+
+where:
+  r_e = Log(Z_e.Inv() @ X_i.Inv() @ X_j)    # Residual in se(3)
+  ||r||²_Λ = r^T Λ r = Σ_k λ_k r_k²         # Mahalanobis norm
+```
+
+**Three Variants:**
+1. **Uniform weights**: `Λ = I` for all edges (weak baseline)
+2. **Homoscedastic MLE**: `Λ = diag(exp(-log_var_mle))` with global constant from Phase 4 (strong baseline)
+3. **Heteroscedastic (ours)**: `Λ = diag(exp(-log_var(x)))` per-sample from uncertainty head
+
+**⚠️ Weight semantics:** After running Sanity Test B, adjust weight computation:
+- If DiagonalCostWeight expects Λ: use `exp(-log_var)`
+- If DiagonalCostWeight expects √Λ: use `exp(-0.5 * log_var)`
+
+**Optimizer:** Levenberg-Marquardt via [Theseus](https://github.com/facebookresearch/theseus) (Meta's differentiable optimization library)
+
+**Why Theseus:**
+- Built-in `th.eb.Between` cost function for relative pose edges
+- Native sparse solver support (efficient for large pose graphs)
+- Weighted edges are first-class citizens
+- Well-documented for SLAM/PGO applications
+
+```python
+import theseus as th
+import torch
+
+def run_pgo_theseus(edges, initial_poses, weight_mode='predicted', log_var_mle=None):
+    """
+    Run PGO using Theseus.
+
+    Args:
+        edges: List of dicts with 'from', 'to', 'measurement', 'information'
+        initial_poses: Dict {node_id: SE3 tensor [4, 4]}
+        weight_mode: 'uniform', 'mle', or 'predicted'
+        log_var_mle: [6] tensor, required if weight_mode='mle'
+    """
+    # Debug: print edge statistics
+    print_edge_statistics(edges)
+
+    # Create optimization variables (poses)
+    # Use sorted keys to handle non-contiguous node IDs
+    node_ids = sorted(initial_poses.keys())
+    poses = {}
+    for i in node_ids:
+        poses[i] = th.SE3(tensor=initial_poses[i].unsqueeze(0), name=f"pose_{i}")
+
+    # Freeze pose 0 (gauge fix)
+    poses[0].freeze()
+
+    # Create cost functions from edges
+    objective = th.Objective()
+
+    for idx, e in enumerate(edges):
+        # Measurement: relative pose Z_{i→j}
+        measurement = th.SE3(tensor=e['measurement'].unsqueeze(0), name=f"Z_{idx}")
+
+        # Weight based on mode
+        if weight_mode == 'uniform':
+            weight = th.eb.DiagonalCostWeight(torch.ones(1, 6))
+        elif weight_mode == 'mle':
+            # Global constant from Phase 4 MLE baseline
+            lambda_mle = torch.exp(-log_var_mle).unsqueeze(0)  # [1, 6]
+            weight = th.eb.DiagonalCostWeight(lambda_mle)
+        else:  # 'predicted'
+            # Per-edge from uncertainty head
+            # ⚠️ Adjust based on Sanity Test B result!
+            weight = th.eb.DiagonalCostWeight(e['information'].unsqueeze(0))
+
+        cost = th.eb.Between(
+            poses[e['from']],
+            poses[e['to']],
+            measurement,
+            weight,
+        )
+        objective.add(cost)
+
+    # Build optimizer - prefer sparse solver for large graphs
+    try:
+        linear_solver_cls = th.CholmodSparseSolver  # Fast for large graphs
+    except AttributeError:
+        print("Warning: CholmodSparseSolver not available, using dense solver")
+        linear_solver_cls = th.CholeskyDenseSolver
+
+    optimizer = th.LevenbergMarquardt(
+        objective,
+        max_iterations=50,
+        step_size=1.0,
+        linear_solver_cls=linear_solver_cls,
+    )
+
+    # Create Theseus layer and optimize
+    layer = th.TheseusLayer(optimizer)
+
+    # Initial values (exclude frozen pose 0)
+    input_tensors = {f"pose_{i}": poses[i].tensor for i in node_ids if i > 0}
+
+    # Run optimization
+    with torch.no_grad():
+        solution, info = layer.forward(input_tensors)
+
+    # Extract optimized poses using actual node IDs (not range!)
+    optimized_poses = {0: poses[0].tensor.squeeze(0)}
+    for i in node_ids:
+        if i > 0:
+            optimized_poses[i] = solution[f"pose_{i}"].squeeze(0)
+
+    return optimized_poses, info
+
+
+def print_edge_statistics(edges):
+    """Debug: check for suspicious edge patterns."""
+    from collections import Counter
+
+    # Count edges per (from, to) pair
+    pair_counts = Counter((e['from'], e['to']) for e in edges)
+
+    print(f"\nEdge Statistics:")
+    print(f"  Total edges: {len(edges)}")
+    print(f"  Unique node pairs: {len(pair_counts)}")
+
+    # Check for excessive duplicates
+    max_count = max(pair_counts.values())
+    if max_count > 10:
+        print(f"  ⚠️ WARNING: Some pairs have {max_count} edges (suspicious!)")
+        top_pairs = pair_counts.most_common(5)
+        for (src, dst), count in top_pairs:
+            print(f"    ({src}, {dst}): {count} edges")
+    else:
+        print(f"  Max edges per pair: {max_count} (OK)")
+```
+
+**Installation:**
+```bash
+pip install theseus-ai
+# For sparse solver (optional, faster for large graphs):
+# conda install -c conda-forge suitesparse
+```
+
+### 5.9.6 Evaluation Metrics
+
+After PGO, evaluate against GT:
+
+| Metric       | Description                                              |
+|:-------------|:---------------------------------------------------------|
+| ATE (SE3)    | Absolute trajectory error after **SE3 alignment** (no scale!) |
+| RPE          | Relative pose error (δ=1)                                |
+| Objective    | Final optimization objective value                       |
+| Convergence  | Number of LM iterations to converge                      |
+
+**⚠️ Why SE3, not Sim3?** We already fit oracle scale per window. Using Sim3 alignment would re-estimate scale globally, masking differences between methods.
+
+**Comparison:**
+
+| Method              | ATE Trans | ATE Rot | RPE Trans | RPE Rot | Objective | Iters |
+|:--------------------|----------:|--------:|----------:|--------:|----------:|------:|
+| Before PGO (init)   |       TBD |     TBD |       TBD |     TBD |       N/A |   N/A |
+| PGO + Uniform       |       TBD |     TBD |       TBD |     TBD |       TBD |   TBD |
+| PGO + Homoscedastic |       TBD |     TBD |       TBD |     TBD |       TBD |   TBD |
+| PGO + Predicted     |       TBD |     TBD |       TBD |     TBD |       TBD |   TBD |
+
+**Why track Objective?**
+- ATE improves but Objective worse → possible alignment/initialization issue
+- Objective improves but ATE worse → measurement bias, consider robust kernel
+
+**Expected Outcome:**
+- `PGO + Predicted` < `PGO + Homoscedastic` < `PGO + Uniform`
+- If Predicted only beats Uniform but not Homoscedastic → we just learned a better constant weight
+
+#### Robust Kernel (Optional but Recommended)
+
+Even with uncertainty weighting, gross outliers (e.g., completely wrong window) can corrupt PGO.
+Adding a robust kernel (Huber) provides insurance:
+
+```python
+# In Theseus, wrap cost with robust kernel
+from theseus.core import HuberLoss
+
+robust_cost = th.RobustCostFunction(
+    cost,
+    loss_cls=HuberLoss,
+    loss_kwargs={"threshold": 1.0},  # Huber threshold
+)
+objective.add(robust_cost)
+```
+
+**Ablation suggestion:** Run at least `Predicted + Robust` vs `Predicted` to see if robustness helps.
+
+#### Pre-Optimization Diagnostic: Edge Error vs Predicted σ
+
+Before optimization, compute each edge's GT residual and correlate with predicted uncertainty:
+
+```python
+def compute_edge_gt_residuals(edges, gt_poses, info_is_sqrt=False):
+    """
+    Compute ground truth residual for each edge (before optimization).
+
+    If uncertainty is meaningful, edges with larger |r_gt| should have larger σ.
+
+    Args:
+        info_is_sqrt: If True, edges['information'] contains √Λ (from Sanity Test B)
+    """
+    gt_residuals = []
+    pred_sigmas = []
+
+    for e in edges:
+        # GT relative pose
+        T_gt_i = gt_poses[e['from']]
+        T_gt_j = gt_poses[e['to']]
+        Z_gt = torch.inverse(T_gt_i) @ T_gt_j  # True relative pose
+
+        # Measurement
+        Z_pred = e['measurement']
+
+        # Residual: Log(Z_pred^{-1} @ Z_gt)
+        r_gt = se3_log(torch.inverse(Z_pred) @ Z_gt)  # [6]
+
+        # Predicted sigma - MUST match how we stored 'information'!
+        info = e['information']
+        if info_is_sqrt:
+            # info = √Λ, so σ = 1/√Λ = 1/info
+            sigma = 1.0 / (info + 1e-12)
+        else:
+            # info = Λ, so σ = 1/√Λ = 1/sqrt(info)
+            sigma = 1.0 / torch.sqrt(info + 1e-12)
+
+        gt_residuals.append(r_gt.abs().mean().item())
+        pred_sigmas.append(sigma.mean().item())
+
+    # Spearman correlation (robust to outliers)
+    from scipy.stats import spearmanr
+    corr, pval = spearmanr(gt_residuals, pred_sigmas)
+
+    print(f"\nPre-opt Edge Diagnostic:")
+    print(f"  Spearman(|r_gt|, σ_pred) = {corr:.3f} (p={pval:.4f})")
+    print(f"  Expected: positive correlation (high σ → high error)")
+
+    return corr, pval
+```
+
+**Important:** The `info_is_sqrt` parameter must match Sanity Test B result to compute sigma correctly.
+
+### 5.9.7 Implementation Steps
+
+**Dependencies:**
+- `theseus-ai` - PGO optimizer
+- `networkx` - MST computation
+
+| Step | Task            | Output                                 |
+|-----:|:----------------|:---------------------------------------|
+|    1 | Window sampler  | List of (start_idx, end_idx) tuples    |
+|    2 | Edge generator  | List of edges with measurements + info |
+|    3 | MST initializer | Initial pose dict {node_id: [4,4]}     |
+|    4 | PGO solver      | Optimized poses (Theseus LM)           |
+|    5 | Evaluation      | ATE/RPE comparison table               |
+
+**Script:** `training/tests/eval_pgo_uncertainty.py`
+
+```bash
+python training/tests/eval_pgo_uncertainty.py \
+    --tum_dir /path/to/tum/freiburg1_desk \
+    --uncertainty_checkpoint ./checkpoints/best.pt \
+    --window_size 8 \
+    --overlap 0.5 \
+    --output_dir ./eval_pgo \
+    --robust  # Optional: enable Huber robust kernel
+```
+
+### 5.9.8 Success Criteria
+
+**Must pass:**
+- [ ] Sanity Test A passes (Theseus residual order verified: trans_rot or rot_trans)
+- [ ] Sanity Test B passes (DiagonalCostWeight semantics verified: lambda or sqrt_lambda)
+- [ ] Graph is connected (or using largest component containing node 0)
+- [ ] PGO converges without NaN/divergence for all three weight modes
+- [ ] `PGO + Predicted` ATE < `PGO + Homoscedastic` ATE < `PGO + Uniform` ATE
+
+**Should pass:**
+- [ ] Pre-opt diagnostic: Spearman(|r_gt|, σ_pred) > 0 (positive correlation)
+- [ ] Objective values are consistent with ATE ranking
+
+**Nice to have:**
+- [ ] Robust kernel ablation: `Predicted + Huber` vs `Predicted`
+
+**Note:** The old criterion "high λ → low residual after opt" is misleading because optimization compresses residuals. The pre-opt GT residual correlation is a cleaner diagnostic.
+
+---
+
 ## Quick Test Checklist
 
 ### Before Training (Phase 1 - Complete)
@@ -710,18 +1345,39 @@ Static sequence test:
 - [x] Verified: Can export uncertainty alongside poses ✓
   - σ_trans: 0.96 cm mean, σ_rot: 0.57° mean on test run
 
+### PGO Evaluation (Phase 5.9 - Planned)
+
+**Sanity Tests (run first!):**
+- [ ] **Sanity Test A**: Theseus residual dimension order verified (trans_rot or rot_trans)
+- [ ] **Sanity Test B**: DiagonalCostWeight semantics verified (lambda or sqrt_lambda)
+- [ ] Store results as `THESEUS_ORDER` and `THESEUS_WEIGHT` globals
+
+**Implementation:**
+- [ ] Window sampler with 50% overlap implemented
+- [ ] Edge generator with correct info/order based on sanity tests
+- [ ] MST initialization handles duplicate edges (keeps best per pair)
+- [ ] MST initialization checks graph connectivity
+- [ ] PGO solver runs without NaN/divergence (all 3 weight modes)
+
+**Evaluation:**
+- [ ] Three-way comparison: Uniform vs Homoscedastic MLE vs Predicted
+- [ ] Pre-opt diagnostic: Spearman(|r_gt|, σ_pred) > 0
+- [ ] Objective values tracked alongside ATE/RPE
+- [ ] Demonstrated: `Predicted` < `Homoscedastic` < `Uniform` ATE
+
 ---
 
 ## Expected Timeline
 
 | Phase | Status | Description | Results |
-|-------|--------|-------------|---------|
+|:------|:-------|:------------|:--------|
 | Phase 1 | Done | Unit tests passing | See [test_lie_algebra.py](../training/tests/test_lie_algebra.py) |
 | Phase 2 | Done | 100-iter smoke test | Loss ↓, no clamp collapse |
 | Phase 3 | Done | 2000-iter training | Best: d²_rot=3.11, d²_trans=3.00. See [§3.4](#34-phase-3-results-2000-iterations) |
 | Phase 4 | Done | Calibration evaluation | d²_rot=2.53, d²_trans=2.77, NLL beats MLE. See [§4.7](#47-phase-4-results-calibration-evaluation) |
 | Phase 5 | Done | Integration with eval | σ_trans=0.96cm, σ_rot=0.57° exported ✓ |
 | Phase 5.5 | Done | Static sequence test | No NaN/Inf ✓ |
+| Phase 5.9 | Planned | PGO evaluation | 3-way: Uniform vs MLE vs Predicted. See [§5.9](#phase-59-pgo-evaluation-uncertainty-value-in-optimization) |
 
 **Detailed Results:**
 - Training analysis & plots: [pose_uncertainty_training_analysis.md](pose_uncertainty_training_analysis.md)
