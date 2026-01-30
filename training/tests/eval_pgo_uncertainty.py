@@ -13,7 +13,7 @@ Usage:
     python training/tests/eval_pgo_uncertainty.py \
         --tum_dir /path/to/tum/freiburg1_desk \
         --uncertainty_checkpoint ./checkpoints/best.pt \
-        --window_size 8 \
+        --window_size 64 \
         --overlap 0.5 \
         --output_dir ./eval_pgo
 """
@@ -315,16 +315,28 @@ def generate_windows(seq_len, window_size, overlap=0.5):
 
 def generate_edges_for_window(
     model, dataset, seq_index, window_start, window_size,
-    gt_poses, device, dtype, theseus_config
+    gt_poses, device, dtype, theseus_config, max_dt=None, global_scale=None,
+    training_style_sampling=False
 ):
     """
-    Generate star-graph edges for a single window.
+    Generate STAR edges (anchor→i) for a single window with GT-based scale normalization.
+
+    STAR EDGES vs CONSECUTIVE EDGES:
+    - Consecutive (i-1→i): Creates only dt=1 pairs, essentially an odometry chain
+    - Star (anchor→i): Creates dt=1..S-1 pairs, enabling loop closures with overlapping windows
+
+    IMPORTANT: This matches the TRAINING semantic - uncertainty head was trained on
+    star constraints (T_rel_i = T_0^{-1} @ T_i), not consecutive constraints.
+
+    Each window's predicted poses are scaled using GT translations before
+    creating edges. This ensures all windows share a consistent scale when chaining
+    via MST, preventing trajectory shape distortion.
 
     Args:
         model: VGGT model
         dataset: TUM dataset
         seq_index: Sequence index
-        window_start: Starting frame index
+        window_start: Starting frame index (this frame becomes the anchor)
         window_size: Window size
         gt_poses: GT poses for the entire sequence [N, 4, 4]
         device: torch device
@@ -336,9 +348,16 @@ def generate_edges_for_window(
     """
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    # Get frames
-    ids = list(range(window_start, window_start + window_size))
-    batch = dataset.get_data(seq_index=seq_index, img_per_seq=window_size, ids=ids, aspect_ratio=1.0)
+    # Get frames - either consecutive (PGO-style) or training-style (ids=None)
+    if training_style_sampling:
+        # Use ids=None to let dataset sample frames with varied spacing (same as training)
+        batch = dataset.get_data(seq_index=seq_index, img_per_seq=window_size, ids=None, aspect_ratio=1.0)
+        # Get the actual frame indices that were sampled
+        sampled_ids = list(batch['ids'])
+    else:
+        # Consecutive frames (original PGO-style)
+        sampled_ids = list(range(window_start, window_start + window_size))
+        batch = dataset.get_data(seq_index=seq_index, img_per_seq=window_size, ids=sampled_ids, aspect_ratio=1.0)
 
     # Prepare images (model handles dtype internally via autocast)
     images = np.stack(batch['images'], axis=0)
@@ -361,51 +380,92 @@ def generate_edges_for_window(
     T_abs = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).expand(window_size, -1, -1).clone()
     T_abs[:, :3, :] = pred_extri[0].float()  # [S, 4, 4]
 
-    # Compute window-relative poses
-    T_anchor_inv = torch.inverse(T_abs[0])  # [4, 4]
-    T_rel = T_anchor_inv.unsqueeze(0) @ T_abs  # [S, 4, 4]
+    # Get GT poses for the sampled frames (use sampled_ids, not window_start range)
+    gt_window = torch.from_numpy(gt_poses[sampled_ids]).float().to(device)  # [S, 4, 4]
 
-    # Fit scale using GT
-    gt_window = gt_poses[ids]  # [S, 4, 4]
-    gt_anchor_inv = np.linalg.inv(gt_window[0])
-    gt_rel = gt_anchor_inv @ gt_window  # [S, 4, 4]
+    # Extract camera centers from absolute poses (w2c: C = -R.T @ t)
+    pred_centers = torch.stack([-T[:3, :3].T @ T[:3, 3] for T in T_abs])  # [S, 3]
+    gt_centers = torch.stack([-T[:3, :3].T @ T[:3, 3] for T in gt_window])  # [S, 3]
 
-    # Scale fitting: minimize ||s * pred_trans - gt_trans||^2
-    pred_trans = T_rel[:, :3, 3].cpu().numpy()  # [S, 3]
-    gt_trans = gt_rel[:, :3, 3]  # [S, 3]
+    # Make relative to anchor (frame 0)
+    pred_c_rel = pred_centers - pred_centers[0:1]  # [S, 3]
+    gt_c_rel = gt_centers - gt_centers[0:1]  # [S, 3]
 
-    # Least squares: s = (pred^T gt) / (pred^T pred)
-    numerator = np.sum(pred_trans * gt_trans)
-    denominator = np.sum(pred_trans * pred_trans) + 1e-12
-    scale = numerator / denominator
-    scale = np.clip(scale, 0.01, 100.0)
+    # Fit scale: use global_scale if provided, otherwise compute per-window
+    pred_c = pred_c_rel[1:]  # [S-1, 3]
+    gt_c = gt_c_rel[1:]       # [S-1, 3]
 
-    # Apply scale
-    T_rel_scaled = T_rel.clone()
-    T_rel_scaled[:, :3, 3] *= scale
+    # Compute window-specific scale for logging (and use if no global_scale)
+    gt_norm = gt_c.norm(dim=-1)
+    pred_norm = pred_c.norm(dim=-1)
+    valid = gt_norm > 0.02  # 2cm threshold
+
+    if valid.sum() >= 2:
+        gt_travel = gt_norm[valid].sum().item()
+        pred_travel = pred_norm[valid].sum().item()
+        window_scale = gt_travel / max(pred_travel, 1e-6)
+        window_scale = max(0.1, min(10.0, window_scale))
+    else:
+        window_scale = 1.0
+        gt_travel = gt_norm.sum().item()
+        pred_travel = pred_norm.sum().item()
+
+    # Use global_scale if provided, otherwise use window_scale
+    if global_scale is not None:
+        scale = global_scale
+        logger.info(f"  Window {window_start}: using global_scale={scale:.3f} (window_scale would be {window_scale:.3f})")
+    else:
+        scale = window_scale
+        logger.info(f"  Scale debug: gt_travel={gt_travel:.4f}m, pred_travel={pred_travel:.4f}m, raw_scale={window_scale:.4f}")
+
+    # Apply scale to camera centers, then convert back to w2c translation
+    # For w2c: t = -R @ C, so scaled_t = -R @ (scale * C) = scale * t
+    # Actually for w2c: C = -R.T @ t, so t = -R @ C
+    # If we scale C to sC, then new_t = -R @ (sC) = s * (-R @ C) = s * t
+    # So we can just scale t directly!
+    T_abs_scaled = T_abs.clone()
+    T_abs_scaled[:, :3, 3] = T_abs[:, :3, 3] * scale
 
     # Debug print
     sigma_trans = torch.exp(0.5 * log_var[0, :, :3]).mean().item()
-    logger.debug(f"Window {window_start}: scale={scale:.3f}, σ_trans={sigma_trans:.4f}m")
+    gt_travel = gt_c.norm(dim=-1).sum().item()
+    pred_travel = pred_c.norm(dim=-1).sum().item()
+    if training_style_sampling:
+        frame_span = sampled_ids[-1] - sampled_ids[0]
+        logger.info(f"Window (training_style): frames={sampled_ids[0]}-{sampled_ids[-1]} (span={frame_span}), scale={scale:.3f}, gt_travel={gt_travel:.3f}m, σ_trans={sigma_trans:.4f}m")
+    else:
+        logger.info(f"Window {window_start}: scale={scale:.3f}, gt_travel={gt_travel:.3f}m, pred_travel={pred_travel:.3f}m, σ_trans={sigma_trans:.4f}m")
 
-    # Create edges (star graph: anchor → each frame)
+    # Create edges (STAR constraints: anchor → i)
+    # This matches training semantic: uncertainty was trained on T_rel = T_0^{-1} @ T_i
+    # Using scaled poses ensures consistent scale across windows
     edges = []
-    anchor_global = window_start
+
+    # Use sampled_ids for global frame indices (handles both consecutive and training-style)
+    anchor_global = sampled_ids[0]  # Anchor is first frame of window
+    T_anchor_inv = torch.inverse(T_abs_scaled[0])  # Inverse of anchor pose
 
     for i in range(1, window_size):
-        global_idx = window_start + i
+        # Filter by max_dt if specified (use actual frame distance from sampled_ids)
+        dt = abs(sampled_ids[i] - sampled_ids[0])  # actual frame distance
+        if max_dt is not None and dt > max_dt:
+            continue
 
-        # Measurement (metric-scaled)
-        Z = T_rel_scaled[i].cpu()  # [4, 4]
+        target_global = sampled_ids[i]  # Use actual sampled frame id
 
-        # Information matrix
-        frame_log_var = log_var[0, i]  # [6]
+        # Star relative pose: Z = T_anchor^{-1} @ T_i (anchor to target)
+        Z_star = T_anchor_inv @ T_abs_scaled[i]  # [4, 4]
+
+        # Use per-frame uncertainty directly (SEMANTICALLY CORRECT)
+        # The uncertainty head was trained for Log(T_rel_gt^{-1} @ T_rel_pred)
+        # where T_rel = T_0^{-1} @ T_i, so log_var[i] is the uncertainty for frame i
+        log_var_i = log_var[0, i]  # [6]
 
         # Adjust based on sanity test results
         if theseus_config["weight_type"] == "lambda":
-            info = torch.exp(-frame_log_var).cpu()  # [6] = Λ
+            info = torch.exp(-log_var_i).cpu()  # [6] = Λ
         else:  # sqrt_lambda
-            info = torch.exp(-0.5 * frame_log_var).cpu()  # [6] = √Λ
+            info = torch.exp(-0.5 * log_var_i).cpu()  # [6] = √Λ
 
         # Dimension order adjustment
         if theseus_config["order"] == "rot_trans":
@@ -413,36 +473,103 @@ def generate_edges_for_window(
 
         edges.append({
             'from': anchor_global,
-            'to': global_idx,
-            'measurement': Z,
+            'to': target_global,
+            'measurement': Z_star.cpu(),
             'information': info,
-            'scale': scale,  # For debugging
         })
 
-    return edges
+    return edges, scale  # Also return the scale used/computed
+
+
+# =============================================================================
+# Graph Diagnostics
+# =============================================================================
+
+def print_graph_diagnostics(edges):
+    """
+    Print graph structure diagnostics: dt histogram and cycle rank.
+
+    For PGO to improve poses, we need:
+    - dt not just =1 (should have edges with dt=1..S-1 from star edges)
+    - cycle_rank > 0 (graph has loops, not just a tree/chain)
+
+    cycle_rank = m - n + c, where m=edges, n=nodes, c=connected components
+    """
+    from collections import Counter
+
+    # Collect all unique pairs and their dt
+    pair_counts = Counter()
+    dt_counts = Counter()
+
+    for e in edges:
+        u, v = e['from'], e['to']
+        pair = (min(u, v), max(u, v))
+        pair_counts[pair] += 1
+        dt = abs(v - u)
+        dt_counts[dt] += 1
+
+    num_edges = len(edges)
+    num_unique_pairs = len(pair_counts)
+    nodes = set()
+    for e in edges:
+        nodes.add(e['from'])
+        nodes.add(e['to'])
+    num_nodes = len(nodes)
+
+    # Simple cycle_rank (assuming 1 connected component)
+    # For graph with loops: m > n-1 (a tree has exactly n-1 edges)
+    cycle_rank = num_unique_pairs - num_nodes + 1  # Assuming 1 component
+
+    logger.info("\n" + "=" * 60)
+    logger.info("Graph Structure Diagnostics")
+    logger.info("=" * 60)
+    logger.info(f"  Nodes: {num_nodes}")
+    logger.info(f"  Total edges: {num_edges}")
+    logger.info(f"  Unique node pairs: {num_unique_pairs}")
+    logger.info(f"  Cycle rank: {cycle_rank} (>0 means graph has loops)")
+
+    # dt histogram
+    logger.info(f"\n  dt (frame distance) histogram:")
+    for dt in sorted(dt_counts.keys()):
+        count = dt_counts[dt]
+        pct = 100.0 * count / num_edges
+        bar = '#' * min(40, int(pct / 2.5))
+        logger.info(f"    dt={dt:2d}: {count:4d} ({pct:5.1f}%) {bar}")
+
+    # Warnings
+    if cycle_rank <= 0:
+        logger.warning("  ⚠️ WARNING: cycle_rank <= 0 (graph is tree/chain, PGO cannot correct drift)")
+    if len(dt_counts) == 1 and 1 in dt_counts:
+        logger.warning("  ⚠️ WARNING: Only dt=1 edges (consecutive), no loop closures possible")
+
+    logger.info("=" * 60 + "\n")
 
 
 # =============================================================================
 # MST Initialization
 # =============================================================================
 
-def initialize_poses_mst(edges, num_nodes):
+def initialize_poses_mst(edges):
     """
     Initialize global poses using MST traversal.
 
-    Handles duplicate edges by keeping the best (highest information) per pair.
+    IMPORTANT: MST weights are based on dt (frame distance), NOT predicted uncertainty.
+    This ensures fair baseline comparison - init doesn't "leak" predicted info.
+
+    Handles duplicate edges by keeping the one with smallest dt.
 
     Returns:
         Dict {node_id: SE3 tensor [4, 4]}
     """
     import networkx as nx
 
-    # Step 1: Keep only best edge per pair
+    # Step 1: Keep only best edge per pair (prefer smaller dt = shorter baseline)
     best_edges = {}
     for e in edges:
         u, v = e['from'], e['to']
         key = (min(u, v), max(u, v))
-        weight = 1.0 / (e['information'].sum().item() + 1e-6)
+        dt = abs(v - u)  # Frame distance
+        weight = float(dt)  # Prefer smaller dt for more stable init
 
         if key not in best_edges or weight < best_edges[key]['weight']:
             best_edges[key] = {
@@ -460,23 +587,31 @@ def initialize_poses_mst(edges, num_nodes):
     for (u, v), data in best_edges.items():
         G.add_edge(u, v, **data)
 
-    # Step 3: Check connectivity
+    # Step 3: Check connectivity and find starting node
+    all_nodes = set(G.nodes())
+    if not all_nodes:
+        logger.error("No nodes in graph!")
+        return {}
+
+    # Use the smallest node id as the root (for consistency)
+    root_node = min(all_nodes)
+
     if not nx.is_connected(G):
         components = list(nx.connected_components(G))
         logger.warning(f"Graph has {len(components)} connected components!")
-        for i, comp in enumerate(components):
-            if 0 in comp:
-                logger.info(f"Using component {i} with {len(comp)} nodes (contains node 0)")
-                G = G.subgraph(comp).copy()
-                break
+        # Use the largest connected component
+        largest_comp = max(components, key=len)
+        logger.info(f"Using largest component with {len(largest_comp)} nodes")
+        G = G.subgraph(largest_comp).copy()
+        root_node = min(largest_comp)
 
     # Step 4: Compute MST
     mst = nx.minimum_spanning_tree(G)
 
-    # Step 5: BFS to initialize poses
-    poses = {0: torch.eye(4)}
+    # Step 5: BFS to initialize poses (starting from root_node)
+    poses = {root_node: torch.eye(4)}
 
-    for parent, child in nx.bfs_edges(mst, source=0):
+    for parent, child in nx.bfs_edges(mst, source=root_node):
         edge_data = mst.edges[parent, child]
 
         if parent == edge_data['src'] and child == edge_data['dst']:
@@ -539,17 +674,18 @@ def run_pgo_theseus(edges, initial_poses, weight_mode='predicted', log_var_mle=N
 
     # Create optimization variables (Theseus SE3 uses 3x4 matrices)
     node_ids = sorted(initial_poses.keys())
+    root_node = node_ids[0]  # Use first node as gauge fix
     poses = {}
     for i in node_ids:
         pose_34 = to_34(initial_poses[i]).unsqueeze(0).float()
         poses[i] = th.SE3(tensor=pose_34, name=f"pose_{i}")
 
-    # Fix pose 0 (gauge fix) using a strong prior
+    # Fix root pose (gauge fix) using a strong prior
     # th.eb.Local computes: error = Log(inv(target) @ var)
     identity_34 = torch.eye(3, 4).unsqueeze(0)
-    prior_target = th.SE3(tensor=identity_34, name="pose_0_prior")
+    prior_target = th.SE3(tensor=identity_34, name=f"pose_{root_node}_prior")
     prior_weight = th.DiagonalCostWeight(torch.ones(1, 6) * 1e8)  # Very high weight
-    prior_cost = th.eb.Local(poses[0], prior_target, prior_weight, name="gauge_fix")
+    prior_cost = th.eb.Local(poses[root_node], prior_target, prior_weight, name="gauge_fix")
     objective = th.Objective()
     objective.add(prior_cost)
 
@@ -566,7 +702,14 @@ def run_pgo_theseus(edges, initial_poses, weight_mode='predicted', log_var_mle=N
         lambda_mle = lambda_mle.unsqueeze(0)
 
     # Create cost functions (add to objective that already has gauge prior)
+    # Filter edges to only include those where both nodes are in poses (handles disconnected graphs)
+    valid_nodes = set(node_ids)
+    edges_used = 0
     for idx, e in enumerate(edges):
+        if e['from'] not in valid_nodes or e['to'] not in valid_nodes:
+            continue  # Skip edges to nodes not in the graph
+        edges_used += 1
+
         # Convert 4x4 measurement to 3x4 for Theseus
         meas_34 = to_34(e['measurement']).unsqueeze(0).float()
         measurement = th.SE3(tensor=meas_34, name=f"Z_{idx}")
@@ -604,23 +747,34 @@ def run_pgo_theseus(edges, initial_poses, weight_mode='predicted', log_var_mle=N
 
     layer = th.TheseusLayer(optimizer)
 
-    # Initial values
-    input_tensors = {f"pose_{i}": poses[i].tensor for i in node_ids if i > 0}
+    # Initial values (exclude the fixed root node)
+    input_tensors = {f"pose_{i}": poses[i].tensor for i in node_ids if i != root_node}
 
     # Optimize
     with torch.no_grad():
         solution, info = layer.forward(input_tensors)
 
+    # Get initial objective from optimization info (if available)
+    # Theseus stores error history in info
+    init_obj = None
+    if hasattr(info, 'err_history') and info.err_history is not None and len(info.err_history) > 0:
+        init_obj = info.err_history[0].item() if hasattr(info.err_history[0], 'item') else info.err_history[0]
+
     # Extract optimized poses (convert 3x4 back to 4x4)
-    optimized_poses = {0: to_44(poses[0].tensor.squeeze(0))}
+    optimized_poses = {root_node: to_44(poses[root_node].tensor.squeeze(0))}
     for i in node_ids:
-        if i > 0:
+        if i != root_node:
             optimized_poses[i] = to_44(solution[f"pose_{i}"].squeeze(0))
 
     # Get final objective value
     final_obj = objective.error_metric().sum().item()
 
-    return optimized_poses, {'objective': final_obj, 'info': info}
+    # If we couldn't get init_obj from history, estimate from final (not ideal)
+    if init_obj is None:
+        init_obj = final_obj  # Fallback: assume no change (conservative)
+        logger.debug("Could not determine initial objective from optimization info")
+
+    return optimized_poses, {'objective': final_obj, 'init_objective': init_obj, 'info': info}
 
 
 # =============================================================================
@@ -796,9 +950,46 @@ def compute_pre_opt_correlation(edges, gt_poses, theseus_config):
 
     corr, pval = stats.spearmanr(gt_residuals, pred_sigmas)
 
+    # Convert to numpy for statistics
+    gt_residuals = np.array(gt_residuals)
+    pred_sigmas = np.array(pred_sigmas)
+
     logger.info(f"\nPre-opt Edge Diagnostic:")
     logger.info(f"  Spearman(|r_gt|, σ_pred) = {corr:.3f} (p={pval:.4f})")
     logger.info(f"  Expected: positive correlation")
+    logger.info(f"")
+    logger.info(f"  GT residual (trans): mean={gt_residuals.mean()*100:.2f}cm, "
+                f"p50={np.percentile(gt_residuals, 50)*100:.2f}cm, "
+                f"p90={np.percentile(gt_residuals, 90)*100:.2f}cm, "
+                f"max={gt_residuals.max()*100:.2f}cm")
+    logger.info(f"  Pred σ_trans: mean={pred_sigmas.mean()*100:.2f}cm, "
+                f"p50={np.percentile(pred_sigmas, 50)*100:.2f}cm, "
+                f"p90={np.percentile(pred_sigmas, 90)*100:.2f}cm, "
+                f"max={pred_sigmas.max()*100:.2f}cm")
+
+    # Compute predicted information (√λ) statistics
+    all_info = [e['information'] for e in edges]
+    info_trans = np.array([i[:3].mean().item() for i in all_info])  # Translation √λ
+    info_rot = np.array([i[3:].mean().item() for i in all_info])    # Rotation √λ
+    logger.info(f"  Pred √λ_trans: mean={info_trans.mean():.1f}, "
+                f"p50={np.percentile(info_trans, 50):.1f}, "
+                f"p90={np.percentile(info_trans, 90):.1f}, "
+                f"max={info_trans.max():.1f}")
+    logger.info(f"  Pred √λ_rot: mean={info_rot.mean():.1f}, "
+                f"p50={np.percentile(info_rot, 50):.1f}, "
+                f"p90={np.percentile(info_rot, 90):.1f}, "
+                f"max={info_rot.max():.1f}")
+
+    # Check if sigma/residual varies with dt (frame distance)
+    dt_list = np.array([abs(e['to'] - e['from']) for e in edges])
+    logger.info(f"")
+    logger.info(f"  Breakdown by dt (frame distance):")
+    for dt_group, dt_label in [(range(1, 11), "dt=1-10"), (range(11, 32), "dt=11-31"), (range(32, 64), "dt=32-63")]:
+        mask = np.isin(dt_list, list(dt_group))
+        if mask.sum() > 0:
+            logger.info(f"    {dt_label}: n={mask.sum()}, "
+                       f"r_trans_mean={gt_residuals[mask].mean()*100:.1f}cm, "
+                       f"σ_trans_mean={pred_sigmas[mask].mean()*100:.2f}cm")
 
     return corr, pval
 
@@ -811,11 +1002,20 @@ def main():
     parser = argparse.ArgumentParser(description='PGO Evaluation for Uncertainty')
     parser.add_argument('--tum_dir', type=str, required=True, help='Path to TUM sequence')
     parser.add_argument('--uncertainty_checkpoint', type=str, required=True, help='Uncertainty head checkpoint')
-    parser.add_argument('--window_size', type=int, default=8, help='Window size')
+    parser.add_argument('--window_size', type=int, default=64, help='Window size (default: 64 frames)')
     parser.add_argument('--overlap', type=float, default=0.5, help='Window overlap ratio')
     parser.add_argument('--output_dir', type=str, default='./eval_pgo', help='Output directory')
     parser.add_argument('--robust', action='store_true', help='Use Huber robust kernel')
     parser.add_argument('--sanity_only', action='store_true', help='Only run sanity tests')
+    parser.add_argument('--max_windows', type=int, default=None, help='Maximum number of windows (for debugging)')
+    parser.add_argument('--single_window_vggt_only', action='store_true',
+                        help='Evaluate single window with VGGT only (no PGO, for quick debugging)')
+    parser.add_argument('--max_dt', type=int, default=None,
+                        help='Max frame distance (dt) for edges. Limits to short baselines where uncertainty is more accurate.')
+    parser.add_argument('--global_scale', action='store_true',
+                        help='Use a single global scale (from first window) for all windows instead of per-window scales.')
+    parser.add_argument('--training_style', action='store_true',
+                        help='Use training-style frame sampling (ids=None with get_nearby=True, varied spacing) instead of consecutive frames.')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -857,26 +1057,84 @@ def main():
 
     # Generate windows
     windows = generate_windows(seq_len, args.window_size, args.overlap)
+    if args.max_windows is not None:
+        windows = windows[:args.max_windows]
     logger.info(f"Generated {len(windows)} windows with {args.overlap*100:.0f}% overlap")
 
-    # Generate edges
-    logger.info("Generating edges...")
+    # Single window mode: just evaluate VGGT on one window, no PGO needed
+    if args.single_window_vggt_only:
+        logger.info("\n[Single Window Mode - Direct VGGT evaluation, no PGO]")
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+        w_start, w_end = windows[0]
+        ids = list(range(w_start, w_start + args.window_size))
+
+        batch = dataset.get_data(seq_index=seq_index, img_per_seq=args.window_size, ids=ids, aspect_ratio=1.0)
+        images = np.stack(batch['images'], axis=0)
+        images = images.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        images_tensor = torch.from_numpy(images).to(device).unsqueeze(0)
+
+        with torch.no_grad():
+            predictions = model(images_tensor)
+
+        pose_enc = predictions['pose_enc_list'][-1]
+        image_hw = images_tensor.shape[-2:]
+        pred_extri, _ = pose_encoding_to_extri_intri(pose_enc, image_size_hw=image_hw)
+        pred_poses_34 = pred_extri[0].float().cpu().numpy()  # [S, 3, 4]
+
+        gt_window = gt_poses[w_start:w_start + args.window_size]  # [S, 4, 4]
+        gt_poses_34 = gt_window[:, :3, :]  # [S, 3, 4]
+
+        # Evaluate using tested implementation
+        ate_result = _compute_ate_impl(pred_poses_34, gt_poses_34, align='sim3',
+                                        gt_convention='w2c', pred_convention='w2c')
+        rpe_result = _compute_rpe_impl(ate_result['aligned_poses'], gt_poses_34, delta=1)
+
+        print("\n" + "=" * 60)
+        print(f"Single Window Evaluation (frames {w_start}-{w_start + args.window_size - 1})")
+        print("=" * 60)
+        print(f"  ATE Trans RMSE: {ate_result['trans_rmse']*100:.2f} cm (p50={ate_result['trans_p50']*100:.2f}, p90={ate_result['trans_p90']*100:.2f}, p99={ate_result['trans_p99']*100:.2f})")
+        print(f"  ATE Rot RMSE:   {ate_result['rot_rmse']:.2f}° (p50={ate_result['rot_p50']:.2f}, p90={ate_result['rot_p90']:.2f}, p99={ate_result['rot_p99']:.2f})")
+        print(f"  RPE Trans RMSE: {rpe_result['trans_rmse']*100:.2f} cm (p50={rpe_result['trans_p50']*100:.2f}, p90={rpe_result['trans_p90']*100:.2f}, p99={rpe_result['trans_p99']*100:.2f})")
+        print(f"  RPE Rot RMSE:   {rpe_result['rot_rmse']:.2f}° (p50={rpe_result['rot_p50']:.2f}, p90={rpe_result['rot_p90']:.2f}, p99={rpe_result['rot_p99']:.2f})")
+        print(f"  Sim3 Scale: {ate_result['scale']:.3f}")
+        return
+
+    # Generate edges (with GT-based scale normalization)
+    scale_mode = "global" if args.global_scale else "per-window"
+    dt_info = f", max_dt={args.max_dt}" if args.max_dt is not None else ""
+    sampling_info = ", training_style" if args.training_style else ", consecutive"
+    logger.info(f"Generating edges (scale={scale_mode}{dt_info}{sampling_info})...")
+
     all_edges = []
-    for w_start, w_end in windows:
-        edges = generate_edges_for_window(
+    global_scale_value = None
+
+    for w_idx, (w_start, _) in enumerate(windows):
+        edges, window_scale = generate_edges_for_window(
             model, dataset, seq_index, w_start, args.window_size,
-            gt_poses, device, dtype, theseus_config
+            gt_poses, device, dtype, theseus_config,
+            max_dt=args.max_dt,
+            global_scale=global_scale_value if args.global_scale else None,
+            training_style_sampling=args.training_style
         )
         all_edges.extend(edges)
 
+        # For global scale mode, capture scale from first window
+        if args.global_scale and w_idx == 0:
+            global_scale_value = window_scale
+            logger.info(f"Using global scale from first window: {global_scale_value:.3f}")
+
     logger.info(f"Total edges: {len(all_edges)}")
+
+    # Graph structure diagnostics
+    print_graph_diagnostics(all_edges)
 
     # Pre-opt diagnostic
     compute_pre_opt_correlation(all_edges, gt_poses, theseus_config)
 
-    # Initialize poses with MST
+    # Initialize poses with MST (uses dt-based weights, not predicted uncertainty)
     logger.info("\nInitializing poses with MST...")
-    initial_poses = initialize_poses_mst(all_edges, seq_len)
+    initial_poses = initialize_poses_mst(all_edges)
 
     # Run PGO with different weight modes
     results = {}
@@ -899,13 +1157,17 @@ def main():
 
         # Debug: print trajectory statistics
         if mode == 'uniform':
+            # Get the GT poses for the frames we optimized
+            num_opt_frames = len(optimized_poses)
+            gt_subset = gt_poses[:num_opt_frames]
+
             # Try both conventions
             # w2c: C = -R.T @ t
-            gt_centers_w2c = np.array([-p[:3, :3].T @ p[:3, 3] for p in gt_poses])
-            pred_centers_w2c = np.array([-p[:3, :3].T @ p[:3, 3] for p in opt_array])
+            gt_centers_w2c = np.array([-p[:3, :3].T @ p[:3, 3] for p in gt_subset])
+            pred_centers_w2c = np.array([-p[:3, :3].T @ p[:3, 3] for p in opt_array[:num_opt_frames]])
             # c2w: C = t directly
-            gt_centers_c2w = np.array([p[:3, 3] for p in gt_poses])
-            pred_centers_c2w = np.array([p[:3, 3] for p in opt_array])
+            gt_centers_c2w = np.array([p[:3, 3] for p in gt_subset])
+            pred_centers_c2w = np.array([p[:3, 3] for p in opt_array[:num_opt_frames]])
 
             logger.info(f"\nTrajectory Stats (before alignment):")
             logger.info(f"  GT (w2c) span: x=[{gt_centers_w2c[:,0].min():.2f}, {gt_centers_w2c[:,0].max():.2f}], "
@@ -924,39 +1186,46 @@ def main():
             logger.info(f"  Pred (w2c) travel: {np.sum(np.linalg.norm(np.diff(pred_centers_w2c, axis=0), axis=1)):.2f} m")
 
         # Evaluate using tested implementations (expects [N, 3, 4] poses, w2c convention)
-        pred_poses_34 = opt_array[:, :3, :]  # [N, 3, 4]
-        gt_poses_34 = gt_poses[:, :3, :]     # [N, 3, 4]
+        # Note: opt_array may cover only a subset of frames (when using --max_windows)
+        num_opt_frames = len(optimized_poses)
+        pred_poses_34 = opt_array[:num_opt_frames, :3, :]  # [N, 3, 4]
+        gt_poses_34 = gt_poses[:num_opt_frames, :3, :]     # [N, 3, 4]
 
         # Use Sim3 alignment from tested implementation
         ate_result = _compute_ate_impl(pred_poses_34, gt_poses_34, align='sim3',
                                         gt_convention='w2c', pred_convention='w2c')
-        rpe_trans, rpe_rot = _compute_rpe_impl(ate_result['aligned_poses'], gt_poses_34, delta=1)
+        rpe_result = _compute_rpe_impl(ate_result['aligned_poses'], gt_poses_34, delta=1)
 
         results[mode] = {
             'ate_trans': ate_result['trans_rmse'],
             'ate_rot': ate_result['rot_rmse'],
-            'rpe_trans': rpe_trans,
-            'rpe_rot': rpe_rot,
+            'rpe_trans': rpe_result['trans_rmse'],
+            'rpe_rot': rpe_result['rot_rmse'],
             'objective': pgo_info['objective'],
+            'init_objective': pgo_info['init_objective'],
             'scale': ate_result['scale'],
         }
 
         logger.info(f"  ATE Trans: {ate_result['trans_rmse']*100:.2f} cm")
         logger.info(f"  ATE Rot:   {ate_result['rot_rmse']:.2f}°")
-        logger.info(f"  RPE Trans: {rpe_trans*100:.2f} cm")
-        logger.info(f"  RPE Rot:   {rpe_rot:.2f}°")
+        logger.info(f"  RPE Trans: {rpe_result['trans_rmse']*100:.2f} cm")
+        logger.info(f"  RPE Rot:   {rpe_result['rot_rmse']:.2f}°")
         logger.info(f"  Sim3 Scale: {ate_result['scale']:.3f}")
         logger.info(f"  Objective: {pgo_info['objective']:.4f}")
 
     # Also evaluate init poses using tested implementation
+    num_init_frames = len(initial_poses)
     init_array = poses_dict_to_array(initial_poses)
-    init_poses_34 = init_array[:, :3, :]  # [N, 3, 4]
-    init_ate_result = _compute_ate_impl(init_poses_34, gt_poses[:, :3, :], align='sim3',
+    init_poses_34 = init_array[:num_init_frames, :3, :]  # [N, 3, 4]
+    init_gt_34 = gt_poses[:num_init_frames, :3, :]  # [N, 3, 4]
+    init_ate_result = _compute_ate_impl(init_poses_34, init_gt_34, align='sim3',
                                          gt_convention='w2c', pred_convention='w2c')
-    init_rpe_trans, init_rpe_rot = _compute_rpe_impl(init_ate_result['aligned_poses'],
-                                                      gt_poses[:, :3, :], delta=1)
+    init_rpe_result = _compute_rpe_impl(init_ate_result['aligned_poses'],
+                                         init_gt_34, delta=1)
     init_ate_trans = init_ate_result['trans_rmse']
     init_ate_rot = init_ate_result['rot_rmse']
+    init_rpe_trans = init_rpe_result['trans_rmse']
+    init_rpe_rot = init_rpe_result['rot_rmse']
 
     # Print summary
     print("\n" + "=" * 80)
@@ -964,6 +1233,8 @@ def main():
     print("=" * 80)
     print(f"{'Method':<20} {'ATE Trans':>12} {'ATE Rot':>10} {'RPE Trans':>12} {'RPE Rot':>10} {'Objective':>12}")
     print("-" * 80)
+
+    # Before PGO row
     print(f"{'Before PGO (init)':<20} {init_ate_trans*100:>10.2f} cm {init_ate_rot:>8.2f}° {init_rpe_trans*100:>10.2f} cm {init_rpe_rot:>8.2f}° {'N/A':>12}")
 
     for mode, r in results.items():

@@ -4,6 +4,10 @@ Phase 3: Training with TensorBoard and WandB Monitoring.
 
 Train the pose uncertainty head with logging for visualization.
 
+Supports augmented data sampling:
+- Original: varied spacing (ids=None with get_nearby=True)
+- Consecutive: fixed window sizes (8, 16, 32, 64) with 50% overlap
+
 Usage:
     # TensorBoard only:
     python training/tests/train_uncertainty_tensorboard.py --tum_dir /path/to/tum --num_iters 500
@@ -15,6 +19,10 @@ Usage:
     # With checkpoint saving:
     python training/tests/train_uncertainty_tensorboard.py --tum_dir /path/to/tum --num_iters 2000 \\
         --checkpoint_dir ./checkpoints --save_interval 500 --wandb
+
+    # With augmented consecutive window sampling (recommended):
+    python training/tests/train_uncertainty_tensorboard.py --tum_dir /path/to/tum --num_iters 5000 \\
+        --augment_consecutive --checkpoint_dir ./checkpoints --wandb
 """
 
 import os
@@ -120,12 +128,12 @@ def verify_trainable_params(model):
 
 class MockCommonConf:
     """Mock configuration for dataset."""
-    def __init__(self):
+    def __init__(self, get_nearby=True):
         self.img_size = 518
         self.patch_size = 14
         self.debug = False
         self.training = True
-        self.get_nearby = True  # Use nearby frames
+        self.get_nearby = get_nearby  # Use nearby frames for varied spacing
         self.load_depth = True
         self.inside_random = False
         self.allow_duplicate_img = False
@@ -135,13 +143,107 @@ class MockCommonConf:
         self.augs = type('obj', (object,), {'scales': None})()
 
 
+class AugmentedDataSampler:
+    """
+    Sampler that mixes varied-spacing and consecutive window sampling.
+
+    Sampling strategies:
+    1. Varied spacing (original): ids=None with get_nearby=True
+       - Samples frames with varying temporal spacing
+       - Good for learning covariance with different baselines
+
+    2. Consecutive windows: fixed frame ranges with 50% overlap
+       - Window sizes: 8, 16, 32, 64 frames
+       - Overlap: 50% between adjacent windows
+       - Good for learning uncertainty at different scales
+    """
+
+    def __init__(self, dataset, window_sizes=[8, 16, 32, 64],
+                 consecutive_ratio=0.5, seed=42):
+        """
+        Args:
+            dataset: TUMRGBDDataset instance
+            window_sizes: List of window sizes for consecutive sampling
+            consecutive_ratio: Probability of using consecutive sampling (0-1)
+            seed: Random seed for reproducibility
+        """
+        self.dataset = dataset
+        self.window_sizes = window_sizes
+        self.consecutive_ratio = consecutive_ratio
+        self.rng = np.random.RandomState(seed)
+
+        # Pre-compute sequence lengths for consecutive sampling
+        self.seq_lengths = []
+        for seq_idx in range(len(dataset.sequence_list)):
+            seq_name = dataset.sequence_list[seq_idx]
+            timestamps = dataset.timestamps_dict[seq_name]
+            self.seq_lengths.append(len(timestamps))
+
+        # Build index of valid (seq_idx, window_start, window_size) tuples
+        self.consecutive_windows = []
+        for window_size in window_sizes:
+            for seq_idx, seq_len in enumerate(self.seq_lengths):
+                if seq_len < window_size:
+                    continue
+                # 50% overlap: step = window_size // 2
+                step = window_size // 2
+                for start in range(0, seq_len - window_size + 1, step):
+                    self.consecutive_windows.append((seq_idx, start, window_size))
+
+        logger.info(f"AugmentedDataSampler initialized:")
+        logger.info(f"  - Window sizes: {window_sizes}")
+        logger.info(f"  - Consecutive ratio: {consecutive_ratio}")
+        logger.info(f"  - Total consecutive windows: {len(self.consecutive_windows)}")
+        logger.info(f"    - By size: {dict((ws, sum(1 for w in self.consecutive_windows if w[2]==ws)) for ws in window_sizes)}")
+
+    def sample(self, iteration):
+        """
+        Sample a batch for the given iteration.
+
+        Returns:
+            dict with keys:
+                - 'seq_idx': sequence index
+                - 'ids': frame indices (list or None)
+                - 'num_frames': number of frames
+                - 'sampling_type': 'varied' or 'consecutive'
+                - 'window_size': window size (for consecutive)
+        """
+        use_consecutive = self.rng.rand() < self.consecutive_ratio
+
+        if use_consecutive and len(self.consecutive_windows) > 0:
+            # Sample a random consecutive window
+            idx = self.rng.randint(len(self.consecutive_windows))
+            seq_idx, start, window_size = self.consecutive_windows[idx]
+            ids = list(range(start, start + window_size))
+            return {
+                'seq_idx': seq_idx,
+                'ids': ids,
+                'num_frames': window_size,
+                'sampling_type': 'consecutive',
+                'window_size': window_size,
+            }
+        else:
+            # Use varied spacing (original method with ids=None)
+            seq_idx = iteration % len(self.dataset.sequence_list)
+            # Default to 8 frames for varied spacing
+            num_frames = 8
+            return {
+                'seq_idx': seq_idx,
+                'ids': None,  # Let dataset handle sampling
+                'num_frames': num_frames,
+                'sampling_type': 'varied',
+                'window_size': num_frames,
+            }
+
+
 def run_training(args):
     """Run training with TensorBoard and optional WandB logging."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     # Setup TensorBoard
-    run_name = f"uncertainty_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    aug_suffix = "_aug" if args.augment_consecutive else ""
+    run_name = f"uncertainty{aug_suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     log_dir = os.path.join(args.log_dir, run_name)
     writer = SummaryWriter(log_dir)
     print(f"\n{'='*60}")
@@ -162,6 +264,9 @@ def run_training(args):
                 "num_frames": args.num_frames,
                 "lr": args.lr,
                 "clamp_residual": args.clamp_residual,
+                "augment_consecutive": args.augment_consecutive,
+                "consecutive_ratio": args.consecutive_ratio,
+                "window_sizes": args.window_sizes,
             }
         )
         print(f"WandB run: {wandb.run.url}")
@@ -175,14 +280,41 @@ def run_training(args):
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
     from data.datasets.tum_rgbd import TUMRGBDDataset
 
-    common_conf = MockCommonConf()
-    dataset = TUMRGBDDataset(
-        common_conf=common_conf,
+    # For consecutive sampling, we need get_nearby=False to use exact frame IDs
+    # For varied spacing, we need get_nearby=True
+    # Create both configs and switch as needed
+    common_conf_nearby = MockCommonConf(get_nearby=True)
+    common_conf_exact = MockCommonConf(get_nearby=False)
+
+    # Determine minimum frames needed
+    if args.augment_consecutive:
+        min_frames = max(args.window_sizes)  # Need at least max window size
+    else:
+        min_frames = args.num_frames
+
+    dataset_nearby = TUMRGBDDataset(
+        common_conf=common_conf_nearby,
         split="train",
         TUM_DIR=args.tum_dir,
-        min_num_images=args.num_frames,
+        min_num_images=min_frames,
     )
-    print(f"Loaded {len(dataset.sequence_list)} sequences")
+    dataset_exact = TUMRGBDDataset(
+        common_conf=common_conf_exact,
+        split="train",
+        TUM_DIR=args.tum_dir,
+        min_num_images=min_frames,
+    )
+    print(f"Loaded {len(dataset_nearby.sequence_list)} sequences")
+
+    # Setup augmented sampler if requested
+    sampler = None
+    if args.augment_consecutive:
+        sampler = AugmentedDataSampler(
+            dataset=dataset_nearby,
+            window_sizes=args.window_sizes,
+            consecutive_ratio=args.consecutive_ratio,
+            seed=42,
+        )
 
     # Load model
     print("\nLoading VGGT model...")
@@ -225,10 +357,39 @@ def run_training(args):
 
     model.train()
 
+    # Track sampling statistics
+    sampling_stats = {'varied': 0, 'consecutive': 0}
+    window_size_stats = {ws: 0 for ws in args.window_sizes}
+
     for iteration in range(start_iteration, args.num_iters):
-        # Get batch
-        seq_idx = iteration % len(dataset.sequence_list)
-        batch = dataset.get_data(seq_index=seq_idx, img_per_seq=args.num_frames, ids=None, aspect_ratio=1.0)
+        # Get batch using augmented sampler or original method
+        if sampler is not None:
+            sample_info = sampler.sample(iteration)
+            seq_idx = sample_info['seq_idx']
+            ids = sample_info['ids']
+            num_frames = sample_info['num_frames']
+            sampling_type = sample_info['sampling_type']
+
+            # Use appropriate dataset based on sampling type
+            if sampling_type == 'consecutive':
+                dataset = dataset_exact
+            else:
+                dataset = dataset_nearby
+
+            # Track statistics
+            sampling_stats[sampling_type] += 1
+            if sampling_type == 'consecutive':
+                window_size_stats[sample_info['window_size']] += 1
+        else:
+            # Original method: varied spacing
+            seq_idx = iteration % len(dataset_nearby.sequence_list)
+            ids = None
+            num_frames = args.num_frames
+            sampling_type = 'varied'
+            dataset = dataset_nearby
+            sampling_stats['varied'] += 1
+
+        batch = dataset.get_data(seq_index=seq_idx, img_per_seq=num_frames, ids=ids, aspect_ratio=1.0)
 
         # Prepare images
         images = np.stack(batch['images'], axis=0)
@@ -364,12 +525,20 @@ def run_training(args):
 
         # Console output
         if step % args.log_interval == 0 or step == 1:
-            print(f"Iter {step:4d} | loss: {loss.item():.4f} | "
+            sample_info_str = f"[{sampling_type[:4]}:{num_frames}f]" if sampler else ""
+            print(f"Iter {step:4d} {sample_info_str} | loss: {loss.item():.4f} | "
                   f"rot_nll: {loss_dict['rot_uncertainty_nll'].item():.3f} | "
                   f"trans_nll: {loss_dict['trans_uncertainty_nll'].item():.3f} | "
                   f"d²_rot: {loss_dict['d2_rot_mean'].item():.2f} | "
                   f"d²_trans: {loss_dict['d2_trans_mean'].item():.2f} | "
                   f"scale: {loss_dict['scale_mean'].item():.3f}")
+
+        # Log sampling statistics periodically
+        if sampler is not None and step % (args.log_interval * 10) == 0:
+            writer.add_scalar('sampling/varied_ratio', sampling_stats['varied'] / max(step, 1), step)
+            writer.add_scalar('sampling/consecutive_ratio', sampling_stats['consecutive'] / max(step, 1), step)
+            for ws in args.window_sizes:
+                writer.add_scalar(f'sampling/window_{ws}', window_size_stats[ws], step)
 
         # Checkpoint saving
         if checkpoint_enabled:
@@ -418,6 +587,14 @@ def run_training(args):
         print(f"Checkpoints saved to: {args.checkpoint_dir}")
         print(f"  - best.pt (calibration_error={best_calibration_error:.2f})")
         print(f"  - final.pt")
+    if sampler is not None:
+        total = sampling_stats['varied'] + sampling_stats['consecutive']
+        print(f"\nSampling statistics:")
+        print(f"  - Varied spacing: {sampling_stats['varied']} ({100*sampling_stats['varied']/total:.1f}%)")
+        print(f"  - Consecutive: {sampling_stats['consecutive']} ({100*sampling_stats['consecutive']/total:.1f}%)")
+        for ws in args.window_sizes:
+            if window_size_stats[ws] > 0:
+                print(f"    - Window {ws}: {window_size_stats[ws]}")
     print(f"{'='*60}")
 
 
@@ -446,6 +623,13 @@ def main():
                         help='Save checkpoint every N iterations')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    # Augmented sampling arguments
+    parser.add_argument('--augment_consecutive', action='store_true',
+                        help='Enable augmented consecutive window sampling')
+    parser.add_argument('--consecutive_ratio', type=float, default=0.5,
+                        help='Ratio of consecutive vs varied sampling (0-1)')
+    parser.add_argument('--window_sizes', type=int, nargs='+', default=[8, 16, 32, 64],
+                        help='Window sizes for consecutive sampling')
     args = parser.parse_args()
 
     run_training(args)
