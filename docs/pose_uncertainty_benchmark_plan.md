@@ -9,124 +9,123 @@ This is sufficient for debugging and validating the pipeline, but insufficient f
 2. **Meaningful PGO improvement** — single-sequence results have ceiling effects (~0.2% ATE gap)
 3. **Interview credibility** — "trained and evaluated on one sequence" is a weakness
 
-This plan scales training and evaluation to multiple sequences with proper train/eval splits.
+This plan scales training and evaluation across multiple datasets in three phases.
 
 ---
 
-## 1. Data
+## Dataset Landscape
 
-### 1.1 TUM RGB-D Sequences
+### Datasets with Sensor-Grade GT Poses (Not in VGGT Training)
 
-Download from https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download
+These are ideal for **evaluation** — clean GT, no overlap with backbone training.
 
-| Sequence | Frames | Motion Type | Split | Notes |
+| Dataset | GT Source | Domain | Sequences | Frames | Download |
+|---|---|---|---|---|---|
+| **TUM RGB-D** | Motion capture (sub-mm) | Indoor | 39 | ~100k | ~20 GB |
+| **7-Scenes** | KinectFusion | Indoor (small rooms) | 7 scenes | ~46k | ~76 GB |
+| **ETH3D** | Laser scanner + mocap | Indoor + Outdoor | 56 SLAM seqs | ~10k | ~42 GB |
+| **KITTI Odometry** | GPS/INS (RTK, <10cm) | Outdoor driving | 11 with GT | ~43k | ~65 GB |
+| **EuRoC MAV** | Vicon (sub-mm) | Indoor (drone) | 11 | ~28k | ~22 GB |
+
+### Datasets In VGGT's Training Distribution
+
+These are ideal for **training the uncertainty head** — the frozen backbone produces strong features.
+
+| Dataset | GT Source | Domain | Scale | Data Loader? |
 |---|---|---|---|---|
-| `freiburg1_desk` | 596 | slow, office | Train | Current data |
-| `freiburg1_desk2` | 620 | slow, office | Train | Similar to desk |
-| `freiburg1_room` | 1362 | medium, room traverse | Train | Larger motion |
-| `freiburg1_plant` | 1146 | slow, close-up | Train | Texture-rich |
-| `freiburg2_desk` | 2965 | slow, office | Train | Different camera (fr2) |
-| `freiburg2_xyz` | 3669 | pure translation | Train | Tests translation uncertainty |
-| `freiburg1_360` | 756 | rotation-heavy | **Eval** | Tests rotation uncertainty |
-| `freiburg1_floor` | 1214 | fast motion | **Eval** | Motion blur, challenging |
-| `freiburg1_teddy` | 1419 | slow, close-up | **Eval** | Different object |
-| `freiburg2_rpy` | 3290 | pure rotation | **Eval** | Tests rotation-only |
-| `freiburg3_long_office` | 2585 | long trajectory | **Eval** | Tests drift |
+| **CO3D v2** | COLMAP | Object-centric (40 categories) | 19k sequences, ~1.5M frames | **Yes** (in codebase) |
+| **ScanNet** | BundleFusion | Indoor scenes | 1,513 scenes, ~2.5M frames | No |
+| **DL3DV** | COLMAP | Indoor + Outdoor (diverse) | 10k videos, 51M frames | No |
+| **Replica** | Synthetic (perfect) | Indoor | 18 scenes | No |
 
-**Train:** 6 sequences (~10k frames) — diverse motion types and cameras
-**Eval:** 5 sequences (~9k frames) — held out, includes challenging conditions
+### Key Insight: Train In-Distribution, Evaluate Out-of-Distribution
 
-### 1.2 Download Commands
+The uncertainty head learns from **residuals** (gap between VGGT prediction and GT).
+If the backbone features are weak (OOD data), residuals are noisy → uncertainty head learns noise.
+If the backbone features are strong (in-distribution), residuals reflect true prediction quality → uncertainty head learns meaningful σ.
+
+**Therefore:** Train on CO3D + TUM (strong backbone features), evaluate on held-out TUM + ETH3D + 7-Scenes (unseen data with clean GT).
+
+---
+
+## Phase 1: Multi-Sequence TUM (Validates Pipeline)
+
+**Goal:** Prove the pipeline works with multiple sequences before scaling to CO3D.
+
+### 1.1 Revised TUM Split
+
+Training diversity matters — the original plan had 3/6 desk scenes. Revised:
+
+| Sequence | Frames | Motion Type | Split | Why |
+|---|---|---|---|---|
+| `freiburg1_desk` | 596 | slow, office | Train | Current data, baseline |
+| `freiburg1_room` | 1362 | medium, room traverse | Train | Larger motion range |
+| `freiburg1_plant` | 1146 | slow, close-up | Train | Texture-rich, different scene |
+| `freiburg2_xyz` | 3669 | pure translation | Train | Translation diversity |
+| `freiburg2_rpy` | 3290 | pure rotation | Train | Rotation diversity |
+| `freiburg2_desk` | 2965 | slow, office | Train | Different camera (fr2 intrinsics) |
+| | | | | |
+| `freiburg1_360` | 756 | rotation-heavy | **Eval** | Rotation generalization |
+| `freiburg1_floor` | 1214 | fast motion | **Eval** | Motion blur, speed |
+| `freiburg1_teddy` | 1419 | slow, close-up | **Eval** | Unseen object |
+| `freiburg3_long_office` | 2585 | long trajectory | **Eval** | Drift, different camera (fr3) |
+
+**Changes from original plan:**
+- Moved `fr2_rpy` from eval→train (rotation diversity in training)
+- Dropped `fr1_desk2` (too similar to desk)
+- Training now covers: slow, medium, translation-only, rotation-only, different cameras
+- Eval still has challenging conditions: fast motion, rotation-heavy, long trajectory, unseen object
+
+### 1.2 Download
 
 ```bash
 TUM_DIR=/home/yiming/Dev/tum_rgbd
 cd $TUM_DIR
 
-# Training sequences
-wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_desk2.tgz
+# Training sequences (we already have freiburg1_desk)
 wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_room.tgz
 wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_plant.tgz
-wget https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_desk.tgz
 wget https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_xyz.tgz
+wget https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_rpy.tgz
+wget https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_desk.tgz
 
 # Eval sequences
 wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_360.tgz
 wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_floor.tgz
 wget https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_teddy.tgz
-wget https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_rpy.tgz
 wget https://cvg.cit.tum.de/rgbd/dataset/freiburg3/rgbd_dataset_freiburg3_long_office_household.tgz
 
 # Extract all
 for f in *.tgz; do tar xzf "$f"; done
 ```
 
-### 1.3 Verification
+### 1.3 Training
 
 ```bash
-# Should see 11 sequences (6 train + 5 eval + the original desk we already have = 11 total, but desk is in train)
-ls -d $TUM_DIR/rgbd_dataset_freiburg*/ | wc -l  # expect: 11
-
-# Each should have rgb.txt, depth.txt, groundtruth.txt
-for d in $TUM_DIR/rgbd_dataset_freiburg*/; do
-    echo "$(basename $d): $(ls $d/{rgb,depth,groundtruth}.txt 2>/dev/null | wc -l)/3 files"
-done
-```
-
----
-
-## 2. Training
-
-### 2.1 Training Configuration
-
-```bash
-# Multi-sequence augmented training
+# Multi-sequence TUM training
+# Note: need --tum_sequences flag to restrict to train split only
 python training/tests/train_uncertainty_tensorboard.py \
     --tum_dir /home/yiming/Dev/tum_rgbd \
     --num_iters 10000 \
     --augment_consecutive \
     --consecutive_ratio 0.5 \
     --window_sizes 8 16 32 64 \
-    --checkpoint_dir ./checkpoints_multi \
+    --checkpoint_dir ./checkpoints_tum_multi \
     --save_interval 1000 \
-    --log_dir ./runs/multi_seq \
+    --log_dir ./runs/tum_multi \
     --loss_type gaussian
 ```
 
-**Key differences from single-sequence:**
-- Dataset loader auto-detects all sequences in `tum_dir`
-- 10k iterations (vs 2k/5k before) — more data needs more training
-- Same augmented sampling: 50% varied + 50% consecutive
+**Script updates needed:**
+- [ ] Add `--tum_sequences` flag to restrict training to specific sequences (exclude eval sequences)
+- [ ] Verify dataset loader works with multiple sequences
 
-### 2.2 Training Variants
-
-Run all three for comparison:
-
-| Variant | Command Flag | Checkpoint Dir | Purpose |
-|---|---|---|---|
-| Gaussian (baseline) | `--loss_type gaussian` | `checkpoints_multi_gaussian` | Main model |
-| Laplace | `--loss_type laplace` | `checkpoints_multi_laplace` | Ablation |
-| Gaussian (varied only) | (no `--augment_consecutive`) | `checkpoints_multi_varied` | Ablation: does augmented sampling help? |
-
-### 2.3 Monitoring
-
-Watch for:
-- d²_rot, d²_trans should approach 3.0 and stay stable
-- Loss should decrease across different sequence types
-- Check TensorBoard: `tensorboard --logdir ./runs/multi_seq`
-
----
-
-## 3. Evaluation Protocol
-
-### 3.1 Per-Sequence PGO Evaluation
-
-For each eval sequence, run PGO with ws=16:
+### 1.4 Evaluation
 
 ```bash
-# Template for each eval sequence
-CKPT=./checkpoints_multi_gaussian/best.pt
+CKPT=./checkpoints_tum_multi/best.pt
 
-for SEQ in freiburg1_360 freiburg1_floor freiburg1_teddy freiburg2_rpy freiburg3_long_office_household; do
+for SEQ in freiburg1_360 freiburg1_floor freiburg1_teddy freiburg3_long_office_household; do
     echo "=== $SEQ ==="
     HF_HUB_OFFLINE=1 python training/tests/eval_pgo_uncertainty.py \
         --tum_dir /home/yiming/Dev/tum_rgbd \
@@ -134,119 +133,268 @@ for SEQ in freiburg1_360 freiburg1_floor freiburg1_teddy freiburg2_rpy freiburg3
         --uncertainty_checkpoint $CKPT \
         --window_size 16 \
         --overlap 0.5 \
-        --output_dir ./eval_benchmark/$SEQ \
+        --output_dir ./eval_benchmark_tum/$SEQ \
         --oracle_isotropic
 done
 ```
 
-**Note:** The eval script may need a `--tum_sequence` flag to select a specific sequence. Check and add if needed.
+### 1.5 Success Criteria (Phase 1)
 
-### 3.2 Metrics per Sequence
-
-For each eval sequence, report:
-
-| Metric | Description |
+| Criterion | Target |
 |---|---|
-| ATE (Uniform) | PGO baseline |
-| ATE (Predicted) | Our method |
-| ATE (Oracle iso) | Upper bound |
-| Spearman | Correlation quality |
-| d² (full) | Calibration on this sequence |
-| Δ ATE (%) | (Uniform - Predicted) / Uniform × 100 |
-
-### 3.3 Aggregate Metrics
-
-Report mean and per-sequence breakdown:
-
-```
-| Sequence         | ATE Uniform | ATE Predicted | ATE Oracle | Δ ATE | Spearman |
-|------------------|-------------|---------------|------------|-------|----------|
-| fr1_360          |             |               |            |       |          |
-| fr1_floor        |             |               |            |       |          |
-| fr1_teddy        |             |               |            |       |          |
-| fr2_rpy          |             |               |            |       |          |
-| fr3_long_office  |             |               |            |       |          |
-|------------------|-------------|---------------|------------|-------|----------|
-| **Mean**         |             |               |            |       |          |
-```
-
-### 3.4 Cross-Validation (Optional)
-
-If time permits: leave-one-out on training sequences to check for overfitting.
+| d² calibration (train distribution) | 2.5–4.0 |
+| Predicted < Uniform ATE on ≥3/4 eval seqs | majority |
+| Spearman on eval seqs | > 0.3 |
 
 ---
 
-## 4. Success Criteria
+## Phase 2: CO3D Training (The Big Win)
 
-### Must Pass
+**Goal:** Train on large-scale, diverse data where the VGGT backbone is strongest.
 
-| Criterion | Target | Why |
-|---|---|---|
-| d² calibration (train dist) | 2.5–4.0 | Model is calibrated |
-| Predicted < Uniform ATE on ≥3/5 eval seqs | majority | Generalization |
-| Mean Δ ATE across eval seqs | > 0% | Net positive |
-| Spearman on eval seqs | > 0.3 | Uncertainty is informative |
+### 2.1 Why CO3D
 
-### Should Pass
+- **In VGGT's training distribution** → backbone features are strong → residuals reflect true prediction quality
+- **Data loader already exists** in the codebase (`training/data/datasets/co3d.py`)
+- **40 object categories**, 19k sequences → massive diversity
+- **Varied viewpoints** — turntable, handheld, close-up, far-away
+- GT from COLMAP (moderate quality, but large scale compensates)
 
-| Criterion | Target | Why |
-|---|---|---|
-| Mean Δ ATE | > 1% | Meaningful improvement |
-| Oracle < Predicted on most seqs | yes | Confirms headroom |
-| Laplace vs Gaussian comparison | one is consistently better | Informative ablation |
+### 2.2 CO3D Setup
 
-### Interview-Ready Deliverables
+CO3D data structure:
+```
+CO3D_DIR/
+├── {category}/{sequence}/
+│   ├── images/*.jpg
+│   ├── depths/*.geometric.png
+│   └── depth_masks/*.png
 
-After this benchmark, you should be able to say:
+CO3D_ANNOTATION_DIR/
+├── {category}_train.jgz
+└── {category}_test.jgz
+```
 
-1. "Trained on 6 TUM sequences (~10k frames), evaluated on 5 held-out sequences"
-2. "Predicted weights improve PGO ATE on X/5 held-out sequences, mean improvement Y%"
-3. "Oracle upper bound shows Z% headroom — motivates full covariance prediction"
-4. "Gaussian vs Laplace: [one] is better because [reason]"
-5. "Failure modes: [sequence X] shows [specific failure] because [reason]"
+Download CO3D from https://github.com/facebookresearch/co3d and annotation files
+from https://huggingface.co/datasets/JianyuanWang/co3d_anno/tree/main
+
+### 2.3 Training Approach
+
+The existing CO3D data loader provides extrinsics, intrinsics, and depth. The uncertainty
+head training script currently only supports TUM. Two options:
+
+**Option A: Adapt `train_uncertainty_tensorboard.py` to support CO3D**
+- Add CO3D dataset loading path
+- Use the same `compute_camera_nll_loss` function (it only needs pose encodings and GT extrinsics)
+- CO3D loader already provides `get_nearby` sampling
+- Main work: handle CO3D batch format → existing loss function interface
+
+**Option B: Use VGGT's native training script with uncertainty loss**
+- Add `camera_nll` loss to the existing `training/train.py`
+- This would use the existing CO3D training pipeline with all augmentations
+- Freeze backbone + pose head, only train uncertainty head
+- Most principled approach (same pipeline, same augmentations)
+
+**Recommended: Option B** — less code, uses the battle-tested training pipeline.
+
+```bash
+# Option B: Add uncertainty training to native training script
+python training/train.py \
+    --config config/train_uncertainty_co3d.yaml \
+    --freeze_backbone \
+    --freeze_pose_head \
+    --max_iters 50000 \
+    --output_dir ./checkpoints_co3d_uncertainty
+```
+
+### 2.4 CO3D Training Config
+
+```yaml
+# config/train_uncertainty_co3d.yaml
+camera_nll:
+  weight: 1.0
+  pose_encoding_type: "absT_quaR_FoV"
+  gamma: 0.6
+  log_var_clamp: [-20.0, 20.0]
+  scale_detach: true
+  min_translation: 0.02
+  loss_type: gaussian  # or laplace
+
+# Data: CO3D with default augmentations
+dataset:
+  co3d:
+    len_train: 10000
+    get_nearby: true
+    img_nums: [2, 24]
+
+# Freeze everything except uncertainty head
+freeze_backbone: true
+freeze_pose_head: true
+
+# Training
+optimizer:
+  lr: 1e-4
+  weight_decay: 0.01
+max_iters: 50000
+```
+
+### 2.5 Mixed Training (CO3D + TUM)
+
+For best results, train on both:
+- CO3D: large scale, diverse objects/viewpoints, strong backbone features
+- TUM: sequential video (matches PGO evaluation), real SLAM trajectory
+
+```yaml
+# Mixed dataset config
+dataset:
+  co3d:
+    len_train: 8000   # 80% CO3D
+  tum_rgbd:
+    len_train: 2000   # 20% TUM
+    augment_consecutive: true
+```
+
+### 2.6 Success Criteria (Phase 2)
+
+| Criterion | Target |
+|---|---|
+| d² calibration (CO3D test split) | 2.5–4.0 |
+| d² calibration (TUM eval sequences) | 2.5–4.0 |
+| Predicted < Uniform on ≥3/4 TUM eval seqs | majority |
+| Mean Δ ATE across TUM eval | > 1% |
+| Spearman on TUM eval | > 0.5 |
+
+---
+
+## Phase 3: Cross-Dataset Evaluation (Generalization Story)
+
+**Goal:** Evaluate on datasets the model has never seen, with sensor-grade GT.
+
+### 3.1 Additional Eval Datasets
+
+| Dataset | Why | Setup Effort | Priority |
+|---|---|---|---|
+| **7-Scenes** | Indoor relocalization benchmark, not in VGGT training | Low (just download + write loader) | High |
+| **ETH3D SLAM** | Laser scanner GT, indoor + outdoor | Medium (needs SLAM sequence loader) | Medium |
+| **KITTI Odometry** | Outdoor, completely different domain | Medium (needs loader) | Low (very OOD) |
+
+### 3.2 7-Scenes Evaluation
+
+7-Scenes is the most practical addition:
+- 7 diverse indoor scenes
+- Well-known benchmark
+- GT from KinectFusion (good enough for relative pose evaluation)
+- ~46k frames total
+
+```bash
+# Download 7-Scenes
+wget http://download.microsoft.com/download/2/8/5/28564B23-0828-408F-8631-23B1EFF1DAC8/chess.zip
+# ... (6 more scenes)
+```
+
+**Eval approach:** Same PGO pipeline, but need a 7-Scenes data loader for frame loading + GT pose extraction.
+
+### 3.3 Results Table (Template)
+
+```
+| Dataset / Sequence    | ATE Uniform | ATE Predicted | ATE Oracle | Δ ATE | Spearman |
+|-----------------------|-------------|---------------|------------|-------|----------|
+| **TUM (held-out)**    |             |               |            |       |          |
+| fr1_360               |             |               |            |       |          |
+| fr1_floor             |             |               |            |       |          |
+| fr1_teddy             |             |               |            |       |          |
+| fr3_long_office       |             |               |            |       |          |
+| TUM Mean              |             |               |            |       |          |
+|-----------------------|-------------|---------------|------------|-------|----------|
+| **7-Scenes**          |             |               |            |       |          |
+| Chess                 |             |               |            |       |          |
+| Fire                  |             |               |            |       |          |
+| Heads                 |             |               |            |       |          |
+| Office                |             |               |            |       |          |
+| Pumpkin               |             |               |            |       |          |
+| RedKitchen            |             |               |            |       |          |
+| Stairs                |             |               |            |       |          |
+| 7-Scenes Mean         |             |               |            |       |          |
+|-----------------------|-------------|---------------|------------|-------|----------|
+| **Overall Mean**      |             |               |            |       |          |
+```
+
+---
+
+## 4. Interview-Ready Deliverables
+
+After completing all phases, you should be able to say:
+
+### Phase 1 (minimum)
+> "Trained on 6 diverse TUM sequences, evaluated on 4 held-out sequences with different motion patterns.
+> Predicted weights improve PGO ATE on X/4 held-out sequences."
+
+### Phase 2 (strong)
+> "Trained on CO3D (19k sequences, 40 categories) + TUM, evaluated on held-out TUM sequences.
+> Large-scale diverse training improved Spearman correlation from 0.74 to Y and PGO improvement from 0.2% to Z%."
+
+### Phase 3 (impressive)
+> "Evaluated on 3 different datasets (TUM, 7-Scenes, ETH3D) with sensor-grade GT.
+> Uncertainty generalizes across domains — [specific numbers]."
+
+### Narrative
+> "This follows the same paradigm as L4P and FoundationPose heads — frozen foundation model + lightweight task-specific head.
+> The key insight is that training in-distribution (CO3D, where the backbone is strongest) produces better uncertainty estimates
+> than training on the evaluation domain (TUM), because the residuals are more informative when backbone features are strong."
 
 ---
 
 ## 5. Implementation Checklist
 
-### Data Preparation
-- [ ] Download 10 additional TUM sequences (5 train + 5 eval)
-- [ ] Verify all sequences load correctly (rgb.txt, depth.txt, groundtruth.txt)
-- [ ] Verify dataset loader auto-detects all sequences
+### Phase 1: Multi-Sequence TUM
+- [ ] Download 9 additional TUM sequences
+- [ ] Add `--tum_sequences` flag to training script (train/eval split)
+- [ ] Add `--tum_sequence` flag to eval script (per-sequence evaluation)
+- [ ] Train: Gaussian + augmented, 10k iters
+- [ ] Eval: 4 held-out sequences × {uniform, predicted, oracle}
+- [ ] Compile results
 
-### Training Script Updates
-- [ ] Verify training script works with multiple sequences (may already work via auto-detection)
-- [ ] Add `--tum_sequences` flag if needed (to specify train-only subset)
-- [ ] Add per-sequence d² logging to monitor calibration across sequence types
+### Phase 2: CO3D Training
+- [ ] Download CO3D dataset + annotations
+- [ ] Option A: Adapt `train_uncertainty_tensorboard.py` for CO3D, or
+- [ ] Option B: Add uncertainty loss to native `training/train.py`
+- [ ] Train: CO3D + TUM mixed, 50k iters
+- [ ] Eval on TUM held-out sequences
+- [ ] Compare: CO3D-trained vs TUM-only-trained
 
-### Evaluation Script Updates
-- [ ] Add `--tum_sequence` flag to eval script (run PGO on a specific sequence)
-- [ ] Add aggregate results output (mean across sequences)
-- [ ] Generate per-sequence + aggregate summary table
-
-### Runs
-- [ ] Train: Gaussian + augmented (10k iters)
-- [ ] Train: Laplace + augmented (10k iters)
-- [ ] Train: Gaussian + varied-only (10k iters, ablation)
-- [ ] Eval: All 3 checkpoints × 5 eval sequences × {uniform, predicted, oracle}
-- [ ] Compile results table
-
-### Documentation
-- [ ] Update test plan with benchmark results
-- [ ] Update interview prep doc with new numbers
+### Phase 3: Cross-Dataset Evaluation
+- [ ] Download 7-Scenes
+- [ ] Write 7-Scenes data loader (frame loading + GT pose extraction)
+- [ ] Run PGO evaluation on 7 scenes
+- [ ] Compile cross-dataset results table
 
 ---
 
 ## 6. Estimated Timeline
 
-| Step | Time | GPU Time |
+| Step | Hands-On | GPU Time |
 |---|---|---|
-| Download + extract data | 30 min | — |
-| Verify data loading | 15 min | — |
-| Script updates (if needed) | 30 min | — |
-| Training (3 variants × 10k iters) | — | ~3 hours each, sequential |
-| Evaluation (3 × 5 × ws=16) | — | ~30 min each, ~4 hours total |
-| Results compilation | 30 min | — |
-| **Total** | ~2 hours hands-on | ~13 hours GPU |
+| **Phase 1** | | |
+| Download TUM sequences | 30 min | — |
+| Script updates (train/eval flags) | 1 hour | — |
+| Training (10k iters) | — | ~3 hours |
+| Evaluation (4 seqs × 3 modes) | — | ~1 hour |
+| **Phase 1 Total** | ~2 hours | ~4 hours |
+| | | |
+| **Phase 2** | | |
+| Download CO3D + annotations | 2 hours | — |
+| Integrate uncertainty loss into training pipeline | 2–4 hours | — |
+| Training (50k iters, CO3D + TUM) | — | ~8 hours |
+| Evaluation | — | ~1 hour |
+| **Phase 2 Total** | ~4–6 hours | ~9 hours |
+| | | |
+| **Phase 3** | | |
+| Download 7-Scenes | 1 hour | — |
+| Write data loader | 2 hours | — |
+| Evaluation | — | ~2 hours |
+| **Phase 3 Total** | ~3 hours | ~2 hours |
+| | | |
+| **Grand Total** | ~9–11 hours | ~15 hours GPU |
 
-GPU time can be reduced by running training overnight.
+Phase 1 can be done in a day. Phase 2 needs CO3D download time + integration work.
+Phase 3 is optional but adds significant interview value. GPU time can overlap with other work.
