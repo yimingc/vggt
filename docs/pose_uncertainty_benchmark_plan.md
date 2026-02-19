@@ -116,9 +116,10 @@ python training/tests/train_uncertainty_tensorboard.py \
     --loss_type gaussian
 ```
 
-**Script updates needed:**
-- [ ] Add `--tum_sequences` flag to restrict training to specific sequences (exclude eval sequences)
-- [ ] Verify dataset loader works with multiple sequences
+**Script updates:** Done.
+- [x] Added `--tum_sequences` flag to restrict training to specific sequences
+- [x] Added `--tum_sequence` flag to eval script for per-sequence evaluation
+- [x] Dataset loader already supported `sequences` parameter
 
 ### 1.4 Evaluation
 
@@ -138,13 +139,36 @@ for SEQ in freiburg1_360 freiburg1_floor freiburg1_teddy freiburg3_long_office_h
 done
 ```
 
-### 1.5 Success Criteria (Phase 1)
+### 1.5 Results (Phase 1) — Completed 2026-02-19
 
-| Criterion | Target |
-|---|---|
-| d² calibration (train distribution) | 2.5–4.0 |
-| Predicted < Uniform ATE on ≥3/4 eval seqs | majority |
-| Spearman on eval seqs | > 0.3 |
+**Training:** 10k iters, Gaussian NLL + augmented consecutive sampling, best checkpoint calibration_error=0.04 (d²_rot=3.02, d²_trans=2.98).
+
+| Sequence | Motion Type | Spearman | ATE Uniform | ATE Predicted | ATE Oracle | Result |
+|---|---|---|---|---|---|---|
+| fr1_360 | rotation-heavy | **0.857** | 20.16 cm | **20.14 cm** | 20.16 cm | SUCCESS |
+| fr1_floor | fast motion | **0.772** | **65.18 cm** | 65.28 cm | 65.27 cm | FAIL |
+| fr1_teddy | unseen object | **0.724** | **65.35 cm** | 66.20 cm | 65.62 cm | FAIL |
+| fr3_long_office | long trajectory | **0.686** | **132.44 cm** | 132.60 cm | 132.55 cm | FAIL |
+| **Mean** | | **0.760** | | | | **1/4** |
+
+### 1.6 Success Criteria Assessment
+
+| Criterion | Target | Actual | Status |
+|---|---|---|---|
+| d² calibration (train distribution) | 2.5–4.0 | 3.02 / 2.98 | PASS |
+| Predicted < Uniform ATE on ≥3/4 eval seqs | majority | 1/4 | FAIL |
+| Spearman on eval seqs | > 0.3 | 0.69–0.86 (mean 0.76) | PASS |
+
+### 1.7 Analysis
+
+**What worked:** Spearman correlation generalizes strongly (0.69–0.86). The uncertainty head correctly *ranks* errors on completely unseen sequences with different motion patterns and cameras. This is the core signal that the head learned meaningful uncertainty.
+
+**What didn't work:** PGO ATE improvement only on 1/4 sequences. However, oracle weighting also fails on 3/4, meaning the PGO formulation itself has limited leverage on these sequences — not a failure of uncertainty quality. Root causes:
+- **fr1_floor** (65cm ATE): Fast motion with motion blur. Even oracle can't improve (65.27 vs 65.18). The base ATE is too high for marginal reweighting to help.
+- **fr1_teddy** (65cm ATE): Large errors throughout. Oracle slightly worse than uniform (65.62 vs 65.35), suggesting isotropic weighting is suboptimal here.
+- **fr3_long_office** (132cm ATE): Extreme drift. PGO with local constraints can't fix global drift.
+
+**Implication for Phase 2:** The strong Spearman results suggest the uncertainty head has genuine predictive value. The PGO bottleneck is in the downstream formulation, not uncertainty quality. CO3D training should improve calibration on the evaluation distribution (closing the d² gap from ~1000-3000 to ~3).
 
 ---
 
@@ -296,28 +320,26 @@ wget http://download.microsoft.com/download/2/8/5/28564B23-0828-408F-8631-23B1EF
 
 ### 3.3 Results Table (Template)
 
-```
-| Dataset / Sequence    | ATE Uniform | ATE Predicted | ATE Oracle | Δ ATE | Spearman |
-|-----------------------|-------------|---------------|------------|-------|----------|
-| **TUM (held-out)**    |             |               |            |       |          |
-| fr1_360               |             |               |            |       |          |
-| fr1_floor             |             |               |            |       |          |
-| fr1_teddy             |             |               |            |       |          |
-| fr3_long_office       |             |               |            |       |          |
-| TUM Mean              |             |               |            |       |          |
-|-----------------------|-------------|---------------|------------|-------|----------|
-| **7-Scenes**          |             |               |            |       |          |
-| Chess                 |             |               |            |       |          |
-| Fire                  |             |               |            |       |          |
-| Heads                 |             |               |            |       |          |
-| Office                |             |               |            |       |          |
-| Pumpkin               |             |               |            |       |          |
-| RedKitchen            |             |               |            |       |          |
-| Stairs                |             |               |            |       |          |
-| 7-Scenes Mean         |             |               |            |       |          |
-|-----------------------|-------------|---------------|------------|-------|----------|
-| **Overall Mean**      |             |               |            |       |          |
-```
+| Dataset / Sequence    | ATE Uniform | ATE Predicted | ATE Oracle | Δ ATE   | Spearman |
+|-----------------------|-------------|---------------|------------|---------|----------|
+| **TUM (held-out)**    |             |               |            |         |          |
+| fr1_360               | 20.16 cm    | **20.14 cm**  | 20.16 cm   | +0.1%   | 0.857    |
+| fr1_floor             | **65.18 cm**| 65.28 cm      | 65.27 cm   | -0.2%   | 0.772    |
+| fr1_teddy             | **65.35 cm**| 66.20 cm      | 65.62 cm   | -1.3%   | 0.724    |
+| fr3_long_office       | **132.44 cm**| 132.60 cm    | 132.55 cm  | -0.1%   | 0.686    |
+| TUM Mean              |             |               |            | -0.4%   | **0.760**|
+|-----------------------|-------------|---------------|------------|---------|----------|
+| **7-Scenes**          |             |               |            |         |          |
+| Chess                 |             |               |            |         |          |
+| Fire                  |             |               |            |         |          |
+| Heads                 |             |               |            |         |          |
+| Office                |             |               |            |         |          |
+| Pumpkin               |             |               |            |         |          |
+| RedKitchen            |             |               |            |         |          |
+| Stairs                |             |               |            |         |          |
+| 7-Scenes Mean         |             |               |            |         |          |
+|-----------------------|-------------|---------------|------------|---------|----------|
+| **Overall Mean**      |             |               |            |         |          |
 
 ---
 
@@ -325,9 +347,10 @@ wget http://download.microsoft.com/download/2/8/5/28564B23-0828-408F-8631-23B1EF
 
 After completing all phases, you should be able to say:
 
-### Phase 1 (minimum)
-> "Trained on 6 diverse TUM sequences, evaluated on 4 held-out sequences with different motion patterns.
-> Predicted weights improve PGO ATE on X/4 held-out sequences."
+### Phase 1 (completed)
+> "Trained on 6 diverse TUM sequences (12k frames), evaluated on 4 held-out sequences with different motion patterns.
+> Spearman correlation 0.69–0.86 on held-out data — uncertainty head generalizes to unseen sequences.
+> PGO improvement limited (1/4 seqs), but oracle also fails on same sequences — bottleneck is PGO formulation, not uncertainty quality."
 
 ### Phase 2 (strong)
 > "Trained on CO3D (19k sequences, 40 categories) + TUM, evaluated on held-out TUM sequences.
@@ -346,13 +369,13 @@ After completing all phases, you should be able to say:
 
 ## 5. Implementation Checklist
 
-### Phase 1: Multi-Sequence TUM
-- [ ] Download 9 additional TUM sequences
-- [ ] Add `--tum_sequences` flag to training script (train/eval split)
-- [ ] Add `--tum_sequence` flag to eval script (per-sequence evaluation)
-- [ ] Train: Gaussian + augmented, 10k iters
-- [ ] Eval: 4 held-out sequences × {uniform, predicted, oracle}
-- [ ] Compile results
+### Phase 1: Multi-Sequence TUM — DONE (2026-02-19)
+- [x] Download 9 additional TUM sequences
+- [x] Add `--tum_sequences` flag to training script (train/eval split)
+- [x] Add `--tum_sequence` flag to eval script (per-sequence evaluation)
+- [x] Train: Gaussian + augmented, 10k iters (best calibration_error=0.04)
+- [x] Eval: 4 held-out sequences × {uniform, predicted, oracle}
+- [x] Compile results (Spearman 0.69–0.86, PGO 1/4)
 
 ### Phase 2: CO3D Training
 - [ ] Download CO3D dataset + annotations

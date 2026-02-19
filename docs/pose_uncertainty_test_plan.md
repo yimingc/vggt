@@ -21,7 +21,7 @@ This document outlines the test plan for verifying the pose uncertainty head imp
 | d² (Mahalanobis) | Calibration: r²·λ should follow χ²(3) | d²_rot=2.53, d²_trans=2.77 (target: 3.0) |
 | NLL | Log-likelihood of residuals under predicted Gaussian | -4.108 (lower = better) |
 | Coverage (kσ) | Fraction of residuals within k standard deviations | 1σ=74%, 2σ=96%, 3σ=99% |
-| Spearman(σ, \|r\|) | Does higher σ predict larger error? | 0.67–0.74 for ws≥16 |
+| Spearman(σ, \|r\|) | Does higher σ predict larger error? | 0.67–0.86 (generalizes to held-out seqs) |
 | ATE after PGO | Downstream value: uncertainty-weighted optimization | Predicted < Uniform for ws≥16 |
 
 ### 2. Data & Supervision
@@ -100,6 +100,22 @@ Uncertainty-weighted Pose Graph Optimization using Theseus (LM solver).
 - Gap between Predicted and Oracle → room to improve (better calibration, full covariance)
 - Improvement is modest due to calibration mismatch on consecutive frames (d² >> 6, see failure mode #1)
 
+**Multi-sequence evaluation** (trained on 6 TUM seqs, evaluated on 4 held-out):
+
+| Sequence | Motion Type | Spearman | ATE Uniform | ATE Predicted | ATE Oracle | PGO Result |
+|---|---|---|---|---|---|---|
+| fr1_360 | rotation-heavy | **0.857** | 20.16 cm | **20.14 cm** | 20.16 cm | SUCCESS |
+| fr1_floor | fast motion | **0.772** | **65.18 cm** | 65.28 cm | 65.27 cm | FAIL |
+| fr1_teddy | unseen object | **0.724** | **65.35 cm** | 66.20 cm | 65.62 cm | FAIL |
+| fr3_long_office | long trajectory | **0.686** | **132.44 cm** | 132.60 cm | 132.55 cm | FAIL |
+| **Mean** | | **0.760** | | | | 1/4 |
+
+**Key findings:**
+- Spearman generalizes well (0.69–0.86) — uncertainty head correctly *ranks* errors on unseen sequences
+- PGO ATE improvement only on 1/4 — but oracle also fails on 3/4, meaning PGO formulation has limited leverage on these sequences (not an uncertainty quality issue)
+- d² calibration on train distribution near-perfect (3.02 rot, 2.98 trans), but d² >> 3 on eval sequences, confirming distribution mismatch
+- Training checkpoint: `checkpoints_tum_multi/best.pt` (calibration_error=0.04, 10k iters, 6 sequences)
+
 ### 8. Reproducibility
 
 | Item | Value |
@@ -117,7 +133,7 @@ Uncertainty-weighted Pose Graph Optimization using Theseus (LM solver).
 - [x] **Augmented training** (Phase 5.10) — completed, Spearman improved 0.675→0.742 (ws=16)
 - [x] **Oracle experiment** — Oracle iso is upper bound (38.57 cm), predicted (38.82) has room to improve
 - [ ] **MLP depth ablation** — 2-layer vs 4-layer head
-- [ ] **Cross-sequence generalization** (Phase 6) — train on fr1/fr2, eval on fr3
+- [x] **Cross-sequence generalization** (Phase 6 / Benchmark Phase 1) — trained on 6 TUM sequences, evaluated on 4 held-out. See [benchmark plan](pose_uncertainty_benchmark_plan.md)
 - [ ] **AUSE metric** — standard uncertainty quality metric, not yet computed
 
 ---
@@ -1971,7 +1987,7 @@ Retrain with augmented data (consecutive windows + varied spacing) - see Phase 5
 | Phase 5.9.10 | Done | Consecutive window eval | Spearman 0.67-0.74, PGO+Pred beats Uniform by ~1%. See [§5.9.10](#phase-5910-consecutive-window-pgo-evaluation-results) |
 | Phase 5.10 | Done | Augmented data training | Spearman 0.742 (ws=16), oracle upper bound 38.57cm. See [§5.10.8](#5108-augmented-training-results) |
 | Phase 5.10.9 | Done | Laplace NLL ablation | Laplace ATE 38.77 < Gaussian 38.82. See [§5.10.9](#5109-laplace-nll-ablation-results) |
-| Phase 6 | Pending | Scale to full TUM | Train on all TUM sequences |
+| Phase 6 (Benchmark P1) | Done | Multi-sequence TUM | 6 train / 4 eval seqs. Spearman 0.69–0.86 on held-out. PGO 1/4. See [benchmark plan](pose_uncertainty_benchmark_plan.md) |
 
 **Detailed Results:**
 - Training analysis & plots: [pose_uncertainty_training_analysis.md](pose_uncertainty_training_analysis.md)
