@@ -646,17 +646,19 @@ def to_44(mat_34):
 
 
 def run_pgo_theseus(edges, initial_poses, weight_mode='predicted', log_var_mle=None,
-                    theseus_config=None, use_robust=False):
+                    theseus_config=None, use_robust=False, oracle_info=None):
     """
     Run PGO using Theseus.
 
     Args:
         edges: List of edge dicts
         initial_poses: Dict {node_id: [4, 4] tensor}
-        weight_mode: 'uniform', 'mle', or 'predicted'
+        weight_mode: 'uniform', 'mle', 'predicted', 'oracle_isotropic', or 'oracle_binned'
         log_var_mle: [6] tensor, required if weight_mode='mle'
         theseus_config: {"order": ..., "weight_type": ...}
         use_robust: Whether to use Huber robust kernel
+        oracle_info: Dict with oracle weights, required for oracle modes:
+            - 'oracle_weights': [N, 6] precomputed weights (sqrt_lambda or lambda based on theseus_config)
 
     Returns:
         optimized_poses: Dict {node_id: [4, 4] tensor}
@@ -718,6 +720,11 @@ def run_pgo_theseus(edges, initial_poses, weight_mode='predicted', log_var_mle=N
             weight = th.DiagonalCostWeight(torch.ones(1, 6))
         elif weight_mode == 'mle':
             weight = th.DiagonalCostWeight(lambda_mle)
+        elif weight_mode in ['oracle_isotropic', 'oracle_binned']:
+            # Oracle weighting: use precomputed weights from oracle_info
+            # Weights are already in correct format (sqrt_lambda or lambda based on theseus_config)
+            oracle_weight = oracle_info['oracle_weights'][idx]  # [6] numpy array
+            weight = th.DiagonalCostWeight(torch.tensor(oracle_weight, dtype=torch.float32).unsqueeze(0))
         else:  # 'predicted'
             weight = th.DiagonalCostWeight(e['information'].unsqueeze(0))
 
@@ -915,53 +922,249 @@ def compute_rpe(pred_poses, gt_poses, delta=1):
     return np.mean(trans_errors), np.mean(rot_errors)
 
 
+def compute_gt_residuals_theseus(edges, gt_poses):
+    """
+    Compute GT residuals using Theseus Between cost.error() for coordinate consistency.
+
+    This ensures the residual is computed in the exact same way as during PGO optimization,
+    avoiding any coordinate system mismatches.
+
+    Args:
+        edges: List of edge dicts with 'from', 'to', 'measurement'
+        gt_poses: [N, 4, 4] numpy array of GT poses
+
+    Returns:
+        residuals_6d: [num_edges, 6] numpy array, Theseus residual order [trans, rot]
+        dt_list: [num_edges] numpy array of frame distances
+    """
+    import theseus as th
+
+    residuals_6d = []
+    dt_list = []
+
+    for e in edges:
+        i, j = e['from'], e['to']
+
+        # GT poses as Theseus SE3 (3x4 format)
+        gt_i_34 = torch.from_numpy(gt_poses[i, :3, :]).unsqueeze(0).float()
+        gt_j_34 = torch.from_numpy(gt_poses[j, :3, :]).unsqueeze(0).float()
+        T_gt_i = th.SE3(tensor=gt_i_34)
+        T_gt_j = th.SE3(tensor=gt_j_34)
+
+        # Measurement (predicted relative pose)
+        meas_34 = e['measurement'][:3, :].unsqueeze(0).float()
+        Z_pred = th.SE3(tensor=meas_34)
+
+        # Compute residual using Theseus Between
+        # Between computes: error = Log(Z^{-1} @ T_i^{-1} @ T_j)
+        unit_weight = th.ScaleCostWeight(1.0)
+        cost = th.eb.Between(T_gt_i, T_gt_j, Z_pred, unit_weight)
+        r = cost.error().squeeze().numpy()  # [6] in Theseus order [trans, rot]
+
+        residuals_6d.append(r)
+        dt_list.append(abs(j - i))
+
+    return np.array(residuals_6d), np.array(dt_list)
+
+
+def compute_oracle_weights_binned(residuals_6d, dt_list, theseus_config):
+    """
+    Compute Oracle-B weights: binned covariance by dt.
+
+    This represents "if we knew the true noise model as a function of dt".
+
+    For each dt bin:
+        σ_t²(dt) = mean(r_t²)  # empirical variance of translation residual
+        σ_R²(dt) = mean(r_R²)  # empirical variance of rotation residual
+        λ_t = 1/σ_t², λ_R = 1/σ_R²
+
+    Args:
+        residuals_6d: [N, 6] numpy array of GT residuals [trans, rot]
+        dt_list: [N] numpy array of frame distances
+        theseus_config: {"order": ..., "weight_type": ...}
+
+    Returns:
+        weights: [N, 6] numpy array of weights (sqrt_lambda if theseus expects sqrt)
+        bin_stats: dict with per-bin statistics for logging
+    """
+    # Define dt bins
+    dt_bins = [(1, 4), (5, 8), (9, 16), (17, 32), (33, 64), (65, 128)]
+
+    # Compute per-bin statistics
+    bin_stats = {}
+    dt_to_bin = {}
+
+    for dt_min, dt_max in dt_bins:
+        mask = (dt_list >= dt_min) & (dt_list <= dt_max)
+        if mask.sum() == 0:
+            continue
+
+        r_trans = residuals_6d[mask, :3]  # [n, 3]
+        r_rot = residuals_6d[mask, 3:]    # [n, 3]
+
+        # Empirical variance (per-dimension, then average)
+        # Or use norm² for isotropic
+        sigma_t_sq = np.mean(r_trans ** 2)  # scalar
+        sigma_R_sq = np.mean(r_rot ** 2)    # scalar
+
+        # Add floor to prevent extreme weights
+        sigma_t_sq = max(sigma_t_sq, 1e-4)  # ~1cm floor
+        sigma_R_sq = max(sigma_R_sq, 1e-4)  # ~0.01 rad floor
+
+        lambda_t = 1.0 / sigma_t_sq
+        lambda_R = 1.0 / sigma_R_sq
+
+        bin_stats[(dt_min, dt_max)] = {
+            'n': mask.sum(),
+            'sigma_t': np.sqrt(sigma_t_sq),
+            'sigma_R': np.sqrt(sigma_R_sq),
+            'lambda_t': lambda_t,
+            'lambda_R': lambda_R,
+        }
+
+        # Map dt values in this bin
+        for dt in range(dt_min, dt_max + 1):
+            dt_to_bin[dt] = (dt_min, dt_max)
+
+    # Assign weights to each edge
+    weights = np.zeros((len(dt_list), 6))
+    for idx, dt in enumerate(dt_list):
+        # Find the bin for this dt
+        bin_key = dt_to_bin.get(dt)
+        if bin_key is None:
+            # dt not in any bin, use global statistics
+            sigma_t_sq = np.mean(residuals_6d[:, :3] ** 2)
+            sigma_R_sq = np.mean(residuals_6d[:, 3:] ** 2)
+            lambda_t = 1.0 / max(sigma_t_sq, 1e-4)
+            lambda_R = 1.0 / max(sigma_R_sq, 1e-4)
+        else:
+            lambda_t = bin_stats[bin_key]['lambda_t']
+            lambda_R = bin_stats[bin_key]['lambda_R']
+
+        # Isotropic: same weight for all 3 trans dims, same for all 3 rot dims
+        # Theseus order: [trans, rot]
+        weights[idx, :3] = lambda_t
+        weights[idx, 3:] = lambda_R
+
+    # Convert to sqrt_lambda if needed
+    if theseus_config["weight_type"] == "sqrt_lambda":
+        weights = np.sqrt(weights)
+
+    return weights, bin_stats
+
+
+def compute_oracle_weights_isotropic(residuals_6d, dt_list, theseus_config):
+    """
+    Compute Oracle weights with trans/rot isotropic + σ_floor.
+
+    Instead of per-dimension λ = 1/r², use:
+        r_t = ||r[:3]||, r_R = ||r[3:]||
+        λ_t = 1/(r_t² + σ_floor_t²)
+        λ_R = 1/(r_R² + σ_floor_R²)
+
+    σ_floor uses median of residuals to avoid extreme weights.
+
+    Args:
+        residuals_6d: [N, 6] numpy array of GT residuals [trans, rot]
+        dt_list: [N] numpy array of frame distances
+        theseus_config: {"order": ..., "weight_type": ...}
+
+    Returns:
+        weights: [N, 6] numpy array of weights (sqrt_lambda if theseus expects sqrt)
+    """
+    # Compute norms
+    r_t_norms = np.linalg.norm(residuals_6d[:, :3], axis=1)  # [N]
+    r_R_norms = np.linalg.norm(residuals_6d[:, 3:], axis=1)  # [N]
+
+    # Floor using median (avoids extreme weights while being data-driven)
+    sigma_floor_t = np.median(r_t_norms)
+    sigma_floor_R = np.median(r_R_norms)
+
+    # Ensure minimum floor
+    sigma_floor_t = max(sigma_floor_t, 0.01)  # 1cm minimum
+    sigma_floor_R = max(sigma_floor_R, 0.01)  # ~0.6° minimum
+
+    logger.info(f"Oracle isotropic: σ_floor_t={sigma_floor_t*100:.1f}cm, σ_floor_R={np.degrees(sigma_floor_R):.1f}°")
+
+    # Compute isotropic weights
+    lambda_t = 1.0 / (r_t_norms ** 2 + sigma_floor_t ** 2)  # [N]
+    lambda_R = 1.0 / (r_R_norms ** 2 + sigma_floor_R ** 2)  # [N]
+
+    # Build 6D weight (isotropic per group)
+    weights = np.zeros((len(dt_list), 6))
+    weights[:, :3] = lambda_t[:, np.newaxis]  # Same for all 3 trans dims
+    weights[:, 3:] = lambda_R[:, np.newaxis]  # Same for all 3 rot dims
+
+    # Convert to sqrt_lambda if needed
+    if theseus_config["weight_type"] == "sqrt_lambda":
+        weights = np.sqrt(weights)
+
+    # Log weight statistics
+    logger.info(f"Oracle isotropic weights: λ_t range=[{lambda_t.min():.1f}, {lambda_t.max():.1f}], "
+                f"λ_R range=[{lambda_R.min():.1f}, {lambda_R.max():.1f}]")
+
+    return weights
+
+
 def compute_pre_opt_correlation(edges, gt_poses, theseus_config):
     """
     Compute correlation between GT residual and predicted sigma.
 
+    Uses Theseus cost.error() for GT residuals to ensure coordinate consistency.
+
+    Also computes d² calibration statistics bucketed by dt (frame distance).
+
+    d² = Σ_k (r_k² * λ_k) should be ~6 for 6-DoF SE(3) if calibrated.
+    For separate rot/trans: d²_rot ~ 3, d²_trans ~ 3.
+
     This validates that uncertainty predicts edge quality.
     """
-    gt_residuals = []
+    # Compute GT residuals using Theseus for coordinate consistency
+    gt_residuals_6d, dt_list = compute_gt_residuals_theseus(edges, gt_poses)
+
+    # Extract trans/rot norms
+    gt_residuals_trans = np.linalg.norm(gt_residuals_6d[:, :3], axis=1)  # [N]
+    gt_residuals_rot = np.linalg.norm(gt_residuals_6d[:, 3:], axis=1)    # [N]
+
+    # Extract predicted information from edges
     pred_sigmas = []
+    pred_info_6d = []
 
     for e in edges:
-        # GT relative pose
-        T_gt_i = gt_poses[e['from']]
-        T_gt_j = gt_poses[e['to']]
-        Z_gt = np.linalg.inv(T_gt_i) @ T_gt_j
-
-        # Measurement
-        Z_pred = e['measurement'].numpy()
-
-        # Residual (simplified: just translation error for now)
-        T_err = np.linalg.inv(Z_pred) @ Z_gt
-        r_trans = np.linalg.norm(T_err[:3, 3])
-
-        # Predicted sigma
-        info = e['information']
+        # Predicted information (in Theseus order: [trans, rot])
+        info = e['information'].numpy()  # Already in Theseus order
+        # Convert sqrt_lambda to lambda for d² computation
         if theseus_config["weight_type"] == "sqrt_lambda":
+            lambda_6d = info ** 2
             sigma = 1.0 / (info + 1e-12)
         else:
-            sigma = 1.0 / torch.sqrt(info + 1e-12)
-        sigma = sigma[:3].mean().item()  # Translation sigma
+            lambda_6d = info
+            sigma = 1.0 / np.sqrt(info + 1e-12)
 
-        gt_residuals.append(r_trans)
-        pred_sigmas.append(sigma)
+        sigma_trans = sigma[:3].mean()  # Translation sigma
 
-    corr, pval = stats.spearmanr(gt_residuals, pred_sigmas)
+        pred_sigmas.append(sigma_trans)
+        pred_info_6d.append(lambda_6d)
 
-    # Convert to numpy for statistics
-    gt_residuals = np.array(gt_residuals)
+    # Convert to numpy arrays
     pred_sigmas = np.array(pred_sigmas)
+    pred_info_6d = np.array(pred_info_6d)  # [N, 6]
+
+    # Spearman correlation
+    corr, pval = stats.spearmanr(gt_residuals_trans, pred_sigmas)
 
     logger.info(f"\nPre-opt Edge Diagnostic:")
     logger.info(f"  Spearman(|r_gt|, σ_pred) = {corr:.3f} (p={pval:.4f})")
     logger.info(f"  Expected: positive correlation")
     logger.info(f"")
-    logger.info(f"  GT residual (trans): mean={gt_residuals.mean()*100:.2f}cm, "
-                f"p50={np.percentile(gt_residuals, 50)*100:.2f}cm, "
-                f"p90={np.percentile(gt_residuals, 90)*100:.2f}cm, "
-                f"max={gt_residuals.max()*100:.2f}cm")
+    logger.info(f"  GT residual (trans): mean={gt_residuals_trans.mean()*100:.2f}cm, "
+                f"p50={np.percentile(gt_residuals_trans, 50)*100:.2f}cm, "
+                f"p90={np.percentile(gt_residuals_trans, 90)*100:.2f}cm, "
+                f"max={gt_residuals_trans.max()*100:.2f}cm")
+    logger.info(f"  GT residual (rot): mean={np.degrees(gt_residuals_rot.mean()):.2f}°, "
+                f"p50={np.degrees(np.percentile(gt_residuals_rot, 50)):.2f}°, "
+                f"p90={np.degrees(np.percentile(gt_residuals_rot, 90)):.2f}°, "
+                f"max={np.degrees(gt_residuals_rot.max()):.2f}°")
     logger.info(f"  Pred σ_trans: mean={pred_sigmas.mean()*100:.2f}cm, "
                 f"p50={np.percentile(pred_sigmas, 50)*100:.2f}cm, "
                 f"p90={np.percentile(pred_sigmas, 90)*100:.2f}cm, "
@@ -980,18 +1183,52 @@ def compute_pre_opt_correlation(edges, gt_poses, theseus_config):
                 f"p90={np.percentile(info_rot, 90):.1f}, "
                 f"max={info_rot.max():.1f}")
 
-    # Check if sigma/residual varies with dt (frame distance)
-    dt_list = np.array([abs(e['to'] - e['from']) for e in edges])
+    # ==========================================================================
+    # d² Calibration Verification
+    # ==========================================================================
+    # d² = Σ_k (r_k² * λ_k) should be ~6 for 6-DoF SE(3) if calibrated
+    # For separate rot/trans: d²_trans ~ 3, d²_rot ~ 3
+    logger.info(f"")
+    logger.info(f"  d² Calibration Verification (expect ~6 for 6-DoF, ~3 for trans/rot each):")
+
+    d2_full = (gt_residuals_6d ** 2 * pred_info_6d).sum(axis=1)  # [N]
+    d2_trans = (gt_residuals_6d[:, :3] ** 2 * pred_info_6d[:, :3]).sum(axis=1)  # [N]
+    d2_rot = (gt_residuals_6d[:, 3:] ** 2 * pred_info_6d[:, 3:]).sum(axis=1)  # [N]
+
+    logger.info(f"    Overall: d²_full  mean={d2_full.mean():.2f} (expect ~6), "
+                f"p50={np.percentile(d2_full, 50):.2f}, "
+                f"p95={np.percentile(d2_full, 95):.2f}")
+    logger.info(f"    Trans:   d²_trans mean={d2_trans.mean():.2f} (expect ~3), "
+                f"p50={np.percentile(d2_trans, 50):.2f}, "
+                f"p95={np.percentile(d2_trans, 95):.2f}")
+    logger.info(f"    Rot:     d²_rot   mean={d2_rot.mean():.2f} (expect ~3), "
+                f"p50={np.percentile(d2_rot, 50):.2f}, "
+                f"p95={np.percentile(d2_rot, 95):.2f}")
+
+    # Breakdown by dt (frame distance)
     logger.info(f"")
     logger.info(f"  Breakdown by dt (frame distance):")
-    for dt_group, dt_label in [(range(1, 11), "dt=1-10"), (range(11, 32), "dt=11-31"), (range(32, 64), "dt=32-63")]:
-        mask = np.isin(dt_list, list(dt_group))
+    dt_ranges = [(1, 4), (5, 8), (9, 16), (17, 32), (33, 64)]
+    for dt_min, dt_max in dt_ranges:
+        mask = (dt_list >= dt_min) & (dt_list <= dt_max)
         if mask.sum() > 0:
-            logger.info(f"    {dt_label}: n={mask.sum()}, "
-                       f"r_trans_mean={gt_residuals[mask].mean()*100:.1f}cm, "
-                       f"σ_trans_mean={pred_sigmas[mask].mean()*100:.2f}cm")
+            logger.info(f"    dt={dt_min:2d}-{dt_max:2d}: n={mask.sum():4d}, "
+                       f"r_trans={gt_residuals_trans[mask].mean()*100:5.1f}cm, "
+                       f"r_rot={np.degrees(gt_residuals_rot[mask].mean()):5.2f}°, "
+                       f"σ_trans={pred_sigmas[mask].mean()*100:5.2f}cm, "
+                       f"d²={d2_full[mask].mean():5.1f} (p95={np.percentile(d2_full[mask], 95):5.1f})")
 
-    return corr, pval
+    return corr, pval, {
+        'gt_residuals_trans': gt_residuals_trans,
+        'gt_residuals_rot': gt_residuals_rot,
+        'gt_residuals_6d': gt_residuals_6d,
+        'pred_info_6d': pred_info_6d,
+        'pred_sigmas': pred_sigmas,
+        'dt_list': dt_list,
+        'd2_full': d2_full,
+        'd2_trans': d2_trans,
+        'd2_rot': d2_rot,
+    }
 
 
 # =============================================================================
@@ -1016,6 +1253,14 @@ def main():
                         help='Use a single global scale (from first window) for all windows instead of per-window scales.')
     parser.add_argument('--training_style', action='store_true',
                         help='Use training-style frame sampling (ids=None with get_nearby=True, varied spacing) instead of consecutive frames.')
+    parser.add_argument('--oracle', action='store_true',
+                        help='[DEPRECATED] Old oracle mode with per-dim 1/r². Use --oracle_isotropic or --oracle_binned instead.')
+    parser.add_argument('--oracle_isotropic', action='store_true',
+                        help='Oracle with trans/rot isotropic weights + σ_floor (median). '
+                             'λ_t = 1/(||r_t||² + σ_floor²), avoids extreme per-dim weights.')
+    parser.add_argument('--oracle_binned', action='store_true',
+                        help='Oracle with binned covariance by dt. '
+                             'Each dt bin uses empirical σ²(dt) = E[r²]. Best "upper bound" estimate.')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1129,20 +1374,61 @@ def main():
     # Graph structure diagnostics
     print_graph_diagnostics(all_edges)
 
-    # Pre-opt diagnostic
-    compute_pre_opt_correlation(all_edges, gt_poses, theseus_config)
+    # Pre-opt diagnostic (returns correlation stats)
+    corr, pval, diag_info = compute_pre_opt_correlation(all_edges, gt_poses, theseus_config)
 
     # Initialize poses with MST (uses dt-based weights, not predicted uncertainty)
     logger.info("\nInitializing poses with MST...")
     initial_poses = initialize_poses_mst(all_edges)
 
+    # Compute oracle weights if needed (using Theseus residuals for coordinate consistency)
+    oracle_info = {}
+    if args.oracle_isotropic or args.oracle_binned:
+        logger.info("\nComputing oracle weights using Theseus residuals...")
+        gt_residuals_6d, dt_list_oracle = compute_gt_residuals_theseus(all_edges, gt_poses)
+        oracle_info['gt_residuals_6d'] = gt_residuals_6d
+        oracle_info['dt_list'] = dt_list_oracle
+
+        if args.oracle_isotropic:
+            oracle_weights_iso = compute_oracle_weights_isotropic(
+                gt_residuals_6d, dt_list_oracle, theseus_config)
+            oracle_info['oracle_weights_isotropic'] = oracle_weights_iso
+
+        if args.oracle_binned:
+            oracle_weights_binned, bin_stats = compute_oracle_weights_binned(
+                gt_residuals_6d, dt_list_oracle, theseus_config)
+            oracle_info['oracle_weights_binned'] = oracle_weights_binned
+            # Log binned statistics
+            logger.info("\nOracle binned covariance statistics:")
+            for (dt_min, dt_max), stats in sorted(bin_stats.items()):
+                logger.info(f"  dt={dt_min:2d}-{dt_max:2d}: n={stats['n']:4d}, "
+                           f"σ_t={stats['sigma_t']*100:5.1f}cm, "
+                           f"σ_R={np.degrees(stats['sigma_R']):5.1f}°, "
+                           f"λ_t={stats['lambda_t']:8.1f}, λ_R={stats['lambda_R']:8.1f}")
+
     # Run PGO with different weight modes
     results = {}
 
-    for mode in ['uniform', 'predicted']:
+    # Determine which modes to run
+    weight_modes = ['uniform', 'predicted']
+    if args.oracle_isotropic:
+        weight_modes.append('oracle_isotropic')
+        logger.info("Oracle isotropic mode enabled: trans/rot isotropic + σ_floor")
+    if args.oracle_binned:
+        weight_modes.append('oracle_binned')
+        logger.info("Oracle binned mode enabled: per-dt-bin empirical covariance")
+
+    for mode in weight_modes:
         logger.info(f"\n{'='*60}")
         logger.info(f"Running PGO with {mode} weights...")
         logger.info(f"{'='*60}")
+
+        # Prepare oracle_info for this mode
+        mode_oracle_info = None
+        if mode == 'oracle_isotropic':
+            mode_oracle_info = {'oracle_weights': oracle_info['oracle_weights_isotropic']}
+        elif mode == 'oracle_binned':
+            mode_oracle_info = {'oracle_weights': oracle_info['oracle_weights_binned']}
 
         optimized_poses, pgo_info = run_pgo_theseus(
             all_edges, initial_poses,
@@ -1150,6 +1436,7 @@ def main():
             log_var_mle=log_var_mle,
             theseus_config=theseus_config,
             use_robust=args.robust,
+            oracle_info=mode_oracle_info,
         )
 
         # Convert to array

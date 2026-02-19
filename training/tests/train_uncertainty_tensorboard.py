@@ -176,8 +176,9 @@ class AugmentedDataSampler:
         self.seq_lengths = []
         for seq_idx in range(len(dataset.sequence_list)):
             seq_name = dataset.sequence_list[seq_idx]
-            timestamps = dataset.timestamps_dict[seq_name]
-            self.seq_lengths.append(len(timestamps))
+            # data_store[seq_name] is a list of frame dicts
+            seq_len = len(dataset.data_store[seq_name])
+            self.seq_lengths.append(seq_len)
 
         # Build index of valid (seq_idx, window_start, window_size) tuples
         self.consecutive_windows = []

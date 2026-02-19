@@ -1218,6 +1218,7 @@ rotation alignment as fallback. This reduced ATE from ~38 cm to ~4-22 cm (depend
 **Why track Objective?**
 - ATE improves but Objective worse → possible alignment/initialization issue
 - Objective improves but ATE worse → measurement bias, consider robust kernel
+- **⚠️ Do NOT compare objective values across weight modes** (uniform vs predicted optimize different objectives). Only compare ATE/RPE.
 
 **Observations:**
 - ✓ SUCCESS: PGO + Predicted ATE slightly better than PGO + Uniform (22.07 vs 22.09 cm)
@@ -1358,7 +1359,7 @@ After switching to star edges in 5.9.9, correlation improved significantly.
 
 ### 5.9.9 Star Edges & Global Scale Fix (2026-01-29)
 
-Based on colleague feedback, several critical issues were identified and fixed:
+Several critical issues were identified and fixed:
 
 **Issues Fixed:**
 1. **Consecutive edges (i-1→i) → Star edges (anchor→i)**: Creates loop closures, matching training semantic
@@ -1581,7 +1582,34 @@ python training/tests/eval_pgo_uncertainty.py \
 
 # 3. Compare predicted vs uniform weights
 #    Success: ATE_predicted < ATE_uniform
+
+# 4. Oracle weighting (upper bound experiment)
+python training/tests/eval_pgo_uncertainty.py \
+    --tum_dir /home/yiming/Dev/tum_rgbd \
+    --uncertainty_checkpoint ./checkpoints_aug/best.pt \
+    --window_size 16 \
+    --oracle  # Uses Λ = 1/(r_gt² + ε) as "perfect" weights
 ```
+
+**d² Calibration Output (check this in step 1-2):**
+
+The script outputs d² = Σ(r_k² * λ_k) bucketed by frame distance:
+```
+d² Calibration Verification (expect ~6 for 6-DoF, ~3 for trans/rot each):
+  Overall: d²_full  mean=X.XX, p50=X.XX, p95=X.XX
+  Trans:   d²_trans mean=X.XX, p50=X.XX, p95=X.XX
+  Rot:     d²_rot   mean=X.XX, p50=X.XX, p95=X.XX
+
+Breakdown by dt (frame distance):
+  dt= 1- 4: n=XXX, r_trans=X.Xcm, d²=X.X (p95=X.X)
+  dt= 5- 8: n=XXX, r_trans=X.Xcm, d²=X.X (p95=X.X)
+  ...
+```
+
+**Oracle Interpretation:**
+- Oracle ATE < Uniform ATE → Weighting by residual magnitude helps
+- Predicted ATE ≈ Oracle ATE → Uncertainty head is near-optimal
+- Predicted ATE >> Oracle ATE → Room for improvement
 
 ### 5.10.7 Success Criteria
 
