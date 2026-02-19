@@ -423,6 +423,7 @@ def run_training(args):
                 scale_detach=True,
                 min_translation=0.02,
                 eps=1e-6,
+                loss_type=args.loss_type,
             )
 
             loss = loss_dict['pose_uncertainty_nll']
@@ -616,6 +617,9 @@ def main():
                         help='TensorBoard log directory')
     parser.add_argument('--clamp_residual', action='store_true',
                         help='Clamp residual_sq (for stability)')
+    parser.add_argument('--loss_type', type=str, default='gaussian',
+                        choices=['gaussian', 'laplace'],
+                        help='NLL loss type: gaussian (default) or laplace (heavier tails)')
     parser.add_argument('--wandb', action='store_true',
                         help='Enable WandB logging')
     parser.add_argument('--checkpoint_dir', type=str, default=None,

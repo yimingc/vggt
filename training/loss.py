@@ -184,6 +184,7 @@ def compute_camera_nll_loss(
     scale_detach=True,  # detach scale to avoid cheating channel
     min_translation=0.02,  # filter near-stationary frames (2cm)
     eps=1e-6,  # for numerical stability
+    loss_type="gaussian",  # "gaussian" or "laplace"
     **kwargs
 ):
     """
@@ -195,14 +196,12 @@ def compute_camera_nll_loss(
     3. Compute SE(3) residual: r = Log(inv(T_rel_gt) @ T_rel_pred)
     4. NLL loss with log-variance parameterization
 
-    L = 0.5 * sum_i (r_i^2 * exp(-log_var_i) + log_var_i)
+    Gaussian NLL: L = 0.5 * (r² * exp(-log_var) + log_var)
+    Laplace NLL:  L = |r| * exp(-0.5 * log_var) + 0.5 * log_var
 
-    where log_var = log(σ²), so σ = exp(0.5 * log_var)
-
-    Advantages of log-variance over sqrt_info:
-    - Naturally centered: log_var=0 means σ=1
-    - Symmetric gradients in both directions
-    - No hard clamp collapse issue
+    For Laplace, log_var still parameterizes the scale b via b = σ = exp(0.5 * log_var).
+    Laplace NLL = |r|/b + log(2b) = |r|*exp(-0.5*log_var) + 0.5*log_var + log(2).
+    The constant log(2) is dropped since it doesn't affect gradients.
 
     Args:
         pred_dict: predictions dict, contains 'pose_enc_list' and 'pose_log_var_list'
@@ -214,6 +213,7 @@ def compute_camera_nll_loss(
         scale_detach: whether to detach scale (prevents cheating channel)
         min_translation: threshold for filtering static frames in scale fitting
         eps: epsilon for numerical stability
+        loss_type: "gaussian" (default) or "laplace" (heavier tails, more robust to outliers)
 
     Returns:
         dict with 'pose_uncertainty_nll' and various logging metrics
@@ -287,13 +287,22 @@ def compute_camera_nll_loss(
         log_var_clamped = log_var_frame.clamp(min=log_var_clamp[0], max=log_var_clamp[1])
 
         # Step 8: NLL loss using log-variance parameterization
-        # NLL = 0.5 * (r² / σ² + log(σ²)) = 0.5 * (r² * exp(-log_var) + log_var)
         residual_sq_raw = residual ** 2
         if residual_sq_clamp is not None:
             residual_sq = residual_sq_raw.clamp(max=residual_sq_clamp)  # Only for smoke test
         else:
             residual_sq = residual_sq_raw
-        nll = 0.5 * (residual_sq * torch.exp(-log_var_clamped) + log_var_clamped)
+
+        if loss_type == "laplace":
+            # Laplace NLL: |r|/b + log(2b) where b = exp(0.5 * log_var)
+            # = |r| * exp(-0.5 * log_var) + 0.5 * log_var  (dropping constant log(2))
+            residual_abs = residual.abs()
+            if residual_sq_clamp is not None:
+                residual_abs = residual_abs.clamp(max=residual_sq_clamp ** 0.5)
+            nll = residual_abs * torch.exp(-0.5 * log_var_clamped) + 0.5 * log_var_clamped
+        else:
+            # Gaussian NLL: 0.5 * (r²/σ² + log(σ²)) = 0.5 * (r² * exp(-log_var) + log_var)
+            nll = 0.5 * (residual_sq * torch.exp(-log_var_clamped) + log_var_clamped)
 
         total_nll += stage_weight * nll.mean()
 
