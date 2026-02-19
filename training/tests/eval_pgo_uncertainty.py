@@ -11,7 +11,8 @@ Comparison:
 
 Usage:
     python training/tests/eval_pgo_uncertainty.py \
-        --tum_dir /path/to/tum/freiburg1_desk \
+        --tum_dir /path/to/tum \
+        --tum_sequence rgbd_dataset_freiburg1_desk \
         --uncertainty_checkpoint ./checkpoints/best.pt \
         --window_size 64 \
         --overlap 0.5 \
@@ -265,8 +266,13 @@ def load_model_and_checkpoint(checkpoint_path, device, dtype):
     return model, mle_log_var
 
 
-def load_dataset(tum_dir):
-    """Load TUM dataset."""
+def load_dataset(tum_dir, sequences=None):
+    """Load TUM dataset.
+
+    Args:
+        tum_dir: Root directory containing TUM sequences.
+        sequences: Optional list of sequence names to load. If None, auto-detect all.
+    """
     from data.datasets.tum_rgbd import TUMRGBDDataset
 
     common_conf = MockCommonConf()
@@ -274,6 +280,7 @@ def load_dataset(tum_dir):
         common_conf=common_conf,
         split='train',
         TUM_DIR=tum_dir,
+        sequences=sequences,
     )
 
     return dataset
@@ -1237,7 +1244,10 @@ def compute_pre_opt_correlation(edges, gt_poses, theseus_config):
 
 def main():
     parser = argparse.ArgumentParser(description='PGO Evaluation for Uncertainty')
-    parser.add_argument('--tum_dir', type=str, required=True, help='Path to TUM sequence')
+    parser.add_argument('--tum_dir', type=str, required=True, help='Path to TUM root directory')
+    parser.add_argument('--tum_sequence', type=str, default=None,
+                        help='Name of the specific TUM sequence to evaluate (e.g. rgbd_dataset_freiburg1_desk). '
+                             'If not set, evaluates the first auto-detected sequence.')
     parser.add_argument('--uncertainty_checkpoint', type=str, required=True, help='Uncertainty head checkpoint')
     parser.add_argument('--window_size', type=int, default=64, help='Window size (default: 64 frames)')
     parser.add_argument('--overlap', type=float, default=0.5, help='Window overlap ratio')
@@ -1282,7 +1292,15 @@ def main():
     # Load model and data
     logger.info("\nLoading model and data...")
     model, log_var_mle = load_model_and_checkpoint(args.uncertainty_checkpoint, device, dtype)
-    dataset = load_dataset(args.tum_dir)
+
+    # If a specific sequence is requested, pass it as a list to filter
+    seq_filter = [args.tum_sequence] if args.tum_sequence else None
+    dataset = load_dataset(args.tum_dir, sequences=seq_filter)
+
+    if len(dataset.sequence_list) == 0:
+        logger.error(f"No sequences found in {args.tum_dir}" +
+                      (f" matching '{args.tum_sequence}'" if args.tum_sequence else ""))
+        return
 
     seq_index = 0
     seq_name = dataset.sequence_list[seq_index]

@@ -23,6 +23,10 @@ Usage:
     # With augmented consecutive window sampling (recommended):
     python training/tests/train_uncertainty_tensorboard.py --tum_dir /path/to/tum --num_iters 5000 \\
         --augment_consecutive --checkpoint_dir ./checkpoints --wandb
+
+    # With specific sequences only:
+    python training/tests/train_uncertainty_tensorboard.py --tum_dir /path/to/tum --num_iters 5000 \\
+        --tum_sequences rgbd_dataset_freiburg1_desk rgbd_dataset_freiburg1_room rgbd_dataset_freiburg2_xyz
 """
 
 import os
@@ -268,6 +272,7 @@ def run_training(args):
                 "augment_consecutive": args.augment_consecutive,
                 "consecutive_ratio": args.consecutive_ratio,
                 "window_sizes": args.window_sizes,
+                "tum_sequences": args.tum_sequences,
             }
         )
         print(f"WandB run: {wandb.run.url}")
@@ -297,15 +302,19 @@ def run_training(args):
         common_conf=common_conf_nearby,
         split="train",
         TUM_DIR=args.tum_dir,
+        sequences=args.tum_sequences,
         min_num_images=min_frames,
     )
     dataset_exact = TUMRGBDDataset(
         common_conf=common_conf_exact,
         split="train",
         TUM_DIR=args.tum_dir,
+        sequences=args.tum_sequences,
         min_num_images=min_frames,
     )
-    print(f"Loaded {len(dataset_nearby.sequence_list)} sequences")
+    print(f"Loaded {len(dataset_nearby.sequence_list)} sequences:")
+    for seq_name in dataset_nearby.sequence_list:
+        print(f"  - {seq_name}")
 
     # Setup augmented sampler if requested
     sampler = None
@@ -635,6 +644,10 @@ def main():
                         help='Ratio of consecutive vs varied sampling (0-1)')
     parser.add_argument('--window_sizes', type=int, nargs='+', default=[8, 16, 32, 64],
                         help='Window sizes for consecutive sampling')
+    # Multi-sequence support
+    parser.add_argument('--tum_sequences', type=str, nargs='+', default=None,
+                        help='List of TUM sequence names to train on (e.g. rgbd_dataset_freiburg1_desk '
+                             'rgbd_dataset_freiburg1_room). If not set, uses all sequences found in tum_dir.')
     args = parser.parse_args()
 
     run_training(args)
