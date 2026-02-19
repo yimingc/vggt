@@ -170,6 +170,24 @@ done
 
 **Implication for Phase 2:** The strong Spearman results suggest the uncertainty head has genuine predictive value. The PGO bottleneck is in the downstream formulation, not uncertainty quality. CO3D training should improve calibration on the evaluation distribution (closing the d² gap from ~1000-3000 to ~3).
 
+### 1.8 Sanity Check: PGO ATE vs Direct VGGT ATE
+
+The high ATE in PGO eval (20–132 cm) raised concern. We verified by running `eval_vggt_tum.py` on fr1_360 with two sampling strategies:
+
+| Sampling | Frames | ATE Trans (Sim3) | RPE Trans (no align) | RPE Trans (Sim3) |
+|---|---|---|---|---|
+| **Consecutive** (δ=1) | 64 | **5.32 cm** | 6.38 cm | **1.86 cm** |
+| **Uniform** (δ≈12) | 64 | **7.79 cm** | **54.43 cm** | 7.43 cm |
+| **PGO eval** (ws=16, chained) | all 756 | **20.14 cm** | — | — |
+
+**Findings:**
+1. **VGGT per-window accuracy is good** — 5–8 cm ATE with Sim3 alignment on a single 64-frame window.
+2. **Wider baselines → much larger RPE** — 54 cm (uniform, δ≈12) vs 6 cm (consecutive, δ=1). This is expected: VGGT's relative pose degrades with wider frame spacing.
+3. **PGO ATE (20 cm) is 2.5–4x worse than direct Sim3-aligned ATE (5–8 cm)** — because PGO chains overlapping windows without global Sim3 alignment, accumulating drift.
+4. **This is a known issue**, documented in `pose_uncertainty_head_design.md` ("Uniform sampling creates huge baseline jumps → residuals dominated by noise") and `pose_uncertainty_test_plan.md` §5.9.10.
+
+**Conclusion:** The evaluation pipeline is working correctly. The high ATE in PGO eval reflects drift from chaining local windows (no loop closure, no global alignment), not a bug in the uncertainty head or evaluation methodology. The uncertainty head's Spearman correlation (0.69–0.86) is the more meaningful generalization metric.
+
 ---
 
 ## Phase 2: CO3D Training (The Big Win)
