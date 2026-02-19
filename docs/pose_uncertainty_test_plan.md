@@ -6,6 +6,98 @@ This document outlines the test plan for verifying the pose uncertainty head imp
 
 **Test Dataset**: TUM RGB-D `freiburg1_desk` (small, well-known indoor sequence)
 
+---
+
+## Project Summary (8-Hole Audit)
+
+### 1. Task Definition & Metrics
+
+**Task:** Train a lightweight uncertainty head on a frozen VGGT backbone to predict per-frame, per-dimension pose uncertainty (diagonal 6-DoF covariance in se(3)).
+
+**Paradigm:** Frozen foundation model + task-specific head (same as L4P, FoundationPose head design).
+
+| Metric | What it measures | Our result |
+|--------|-----------------|------------|
+| d² (Mahalanobis) | Calibration: r²·λ should follow χ²(3) | d²_rot=2.53, d²_trans=2.77 (target: 3.0) |
+| NLL | Log-likelihood of residuals under predicted Gaussian | -4.108 (lower = better) |
+| Coverage (kσ) | Fraction of residuals within k standard deviations | 1σ=74%, 2σ=96%, 3σ=99% |
+| Spearman(σ, \|r\|) | Does higher σ predict larger error? | 0.67–0.74 for ws≥16 |
+| ATE after PGO | Downstream value: uncertainty-weighted optimization | Predicted < Uniform for ws≥16 |
+
+### 2. Data & Supervision
+
+- **Dataset:** TUM RGB-D freiburg1_desk (596 frames, known GT poses)
+- **Supervision signal:** GT relative poses provide residuals; NLL loss needs no extra annotation
+- **Train/eval split:** Same sequence (overfitting expected — Phase 6 plans cross-sequence validation on fr3_*)
+- **Sampling:** Varied frame spacing via `get_nearby=True` (8 frames across ~30 frame span)
+
+### 3. Baselines
+
+| Baseline | Description | NLL | d² |
+|----------|-------------|-----|-----|
+| σ = 1 (weak) | Arbitrary constant, sanity check | 0.0001 | N/A |
+| **Homoscedastic MLE (strong)** | Best constant σ per dimension: σ_k² = E[r_k²] | -4.053 | 3.0 by definition |
+| **Ours (heteroscedastic)** | Per-sample σ from uncertainty head | **-4.108** | 2.53 / 2.77 |
+
+Key claim: **Ours beats MLE** → the head learned useful per-sample uncertainty, not just a better constant.
+
+### 4. Loss & Training
+
+- **Loss:** Gaussian NLL: `0.5 * (r² · exp(-log_var) + log_var)`, summed over 6 DoF
+- **Parameterization:** log-variance (numerically stable, unconstrained output)
+- **Backbone:** Frozen VGGT (only ~2.1M uncertainty head parameters trained)
+- **Optimizer:** AdamW, LR=1e-4, 2000 iterations
+- **Key design choice:** Scale fitting (VGGT predicts up-to-scale) detached from gradient → uncertainty head cannot cheat by manipulating scale
+
+### 5. Ablations
+
+**Gap:** No formal ablations run yet. Planned:
+- [ ] Gaussian NLL vs Laplace NLL (heavier tails, may handle outliers better)
+- [ ] MLP depth: 2-layer vs 4-layer head
+- [ ] Frozen vs fine-tuned backbone (expect: fine-tuned overfits on single sequence)
+
+### 6. Error Analysis & Failure Modes
+
+| Failure mode | Observed? | Details |
+|---|---|---|
+| **Training-eval distribution mismatch** | Yes | σ trained on varied spacing (~1cm residuals), but consecutive frames have ~10-40cm residuals. σ underestimated 10-30x. See [§5.9.10](#phase-5910-consecutive-window-pgo-evaluation-results) |
+| **Diagonal assumption limiting** | Yes | vx-wy coupling = -0.557. Full 6×6 covariance would capture this. See [§4.7](#47-phase-4-results-calibration-evaluation) |
+| **Static/degenerate input** | Tested, passes | No NaN/Inf on repeated identical frames. See [§5.5](#phase-55-failure-mode-test-static-sequence) |
+| **Single-sequence overfitting** | Expected | Best checkpoint at iter 544 (early stopping needed). Later iters overconfident. See [§3.4](#34-phase-3-results-2000-iterations) |
+
+### 7. Downstream Value (PGO)
+
+Uncertainty-weighted Pose Graph Optimization using Theseus (LM solver):
+
+| Window Size | Spearman | ATE (Uniform) | ATE (Predicted) | Improvement |
+|:-----------:|:--------:|:-------------:|:---------------:|:-----------:|
+| 16 | 0.675 | 38.89 cm | 38.80 cm | +0.2% |
+| 24 | 0.738 | 39.32 cm | 38.94 cm | +1.0% |
+| 32 | 0.733 | 37.64 cm | 37.29 cm | +0.9% |
+
+Improvement is modest due to calibration mismatch (see failure mode #1). Augmented training (Phase 5.10) expected to close the gap.
+
+### 8. Reproducibility
+
+| Item | Value |
+|------|-------|
+| GPU | Single GPU (RTX 4090 / A100) |
+| Batch size | 1 |
+| Training time | ~30 min for 2000 iterations |
+| Trainable params | ~2.1M (uncertainty MLP only) |
+| Multi-seed | Not tested (single run) |
+| Checkpoint | `checkpoints/best.pt` (iteration 544, early-stopped on d²) |
+
+### Open Items
+
+- [ ] **Ablations** — Gaussian vs Laplace NLL, head depth, frozen vs fine-tuned
+- [ ] **Augmented training** (Phase 5.10) — consecutive + varied sampling to fix calibration mismatch
+- [ ] **Oracle experiment** — code ready, needs to be run for upper-bound analysis
+- [ ] **Cross-sequence generalization** (Phase 6) — train on fr1/fr2, eval on fr3
+- [ ] **AUSE metric** — standard uncertainty quality metric, not yet computed
+
+---
+
 ## Table of Contents
 
 - [Phase 1: Pre-Training Verification](#phase-1-pre-training-verification-complete)
