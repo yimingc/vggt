@@ -287,6 +287,139 @@ def load_dataset(tum_dir, sequences=None):
 
 
 # =============================================================================
+# Loop Closure Detection
+# =============================================================================
+
+def find_loop_closure_candidates(gt_poses, min_temporal_gap=100, spatial_threshold=0.3,
+                                  max_rotation_deg=60.0):
+    """
+    Find spatially-close but temporally-distant frame pairs using GT poses.
+
+    Candidates must satisfy:
+    1. Temporal gap > min_temporal_gap frames
+    2. Camera center distance < spatial_threshold meters
+    3. Camera viewing direction difference < max_rotation_deg degrees
+
+    The rotation check ensures the cameras have overlapping frustums, not just
+    spatial proximity (e.g., a camera facing away would be spatially close but
+    have no visual overlap).
+
+    Args:
+        gt_poses: [N, 4, 4] GT poses in w2c convention
+        min_temporal_gap: Minimum frame index gap (default: 100)
+        spatial_threshold: Max camera center distance in meters (default: 0.3)
+        max_rotation_deg: Max rotation angle between cameras in degrees (default: 60)
+
+    Returns:
+        List of (frame_i, frame_j, distance, rot_deg) sorted by distance
+    """
+    N = len(gt_poses)
+
+    # Extract camera centers: C = -R^T @ t (w2c convention)
+    centers = np.array([-gt_poses[i, :3, :3].T @ gt_poses[i, :3, 3] for i in range(N)])
+
+    # Extract rotation matrices for attitude check
+    rotations = gt_poses[:, :3, :3]  # [N, 3, 3] w2c rotation
+
+    candidates = []
+    for i in range(N):
+        for j in range(i + min_temporal_gap, N):
+            dist = np.linalg.norm(centers[i] - centers[j])
+            if dist < spatial_threshold:
+                # Check camera attitude similarity
+                # Relative rotation: R_rel = R_j @ R_i^T
+                R_rel = rotations[j] @ rotations[i].T
+                # Rotation angle from trace: angle = arccos((trace(R)-1)/2)
+                trace_val = np.clip((np.trace(R_rel) - 1) / 2, -1, 1)
+                rot_deg = np.degrees(np.arccos(trace_val))
+                if rot_deg < max_rotation_deg:
+                    candidates.append((i, j, dist, rot_deg))
+
+    # Sort by distance
+    candidates.sort(key=lambda x: x[2])
+
+    logger.info(f"Loop closure: found {len(candidates)} candidates "
+                f"(gap>{min_temporal_gap}, dist<{spatial_threshold}m, rot<{max_rotation_deg}°)")
+    if candidates:
+        logger.info(f"  Closest: frames ({candidates[0][0]}, {candidates[0][1]}), "
+                     f"dist={candidates[0][2]*100:.1f}cm, rot={candidates[0][3]:.1f}°")
+        logger.info(f"  Farthest: frames ({candidates[-1][0]}, {candidates[-1][1]}), "
+                     f"dist={candidates[-1][2]*100:.1f}cm, rot={candidates[-1][3]:.1f}°")
+
+    return candidates
+
+
+def construct_loop_closure_windows(candidates, seq_len, window_size=16,
+                                    max_lc_windows=10, overlap_threshold=0.5):
+    """
+    Build windows containing frames from both first-visit and revisit regions.
+
+    For each candidate pair (i, j):
+    - Take window_size//2 consecutive frames centered at i (first visit)
+    - Take window_size//2 consecutive frames centered at j (revisit)
+    - Merge and sort into one LC window
+
+    Deduplicates windows that overlap heavily with already-selected ones.
+
+    Args:
+        candidates: List of (frame_i, frame_j, distance, rot_deg)
+        seq_len: Total sequence length
+        window_size: Target window size (default: 16)
+        max_lc_windows: Maximum number of LC windows (default: 10)
+        overlap_threshold: Fraction of shared frames to consider duplicate (default: 0.5)
+
+    Returns:
+        List of frame index lists (each sorted)
+    """
+    half = window_size // 2
+    selected_windows = []
+
+    for (fi, fj, dist, rot_deg) in candidates:
+        if len(selected_windows) >= max_lc_windows:
+            break
+
+        # Build first-visit region centered at fi
+        start_i = max(0, fi - half // 2)
+        end_i = min(seq_len, start_i + half)
+        start_i = max(0, end_i - half)  # Adjust if clamped at end
+        region_i = list(range(start_i, end_i))
+
+        # Build revisit region centered at fj
+        start_j = max(0, fj - half // 2)
+        end_j = min(seq_len, start_j + half)
+        start_j = max(0, end_j - half)
+        region_j = list(range(start_j, end_j))
+
+        # Merge, deduplicate, sort
+        window_frames = sorted(set(region_i + region_j))
+
+        # Trim to window_size if needed (keep frames closest to the two centers)
+        if len(window_frames) > window_size:
+            # Keep frames closest to either center
+            window_frames.sort(key=lambda f: min(abs(f - fi), abs(f - fj)))
+            window_frames = sorted(window_frames[:window_size])
+
+        # Check overlap with already selected windows
+        window_set = set(window_frames)
+        is_duplicate = False
+        for existing in selected_windows:
+            existing_set = set(existing)
+            overlap = len(window_set & existing_set) / max(len(window_set), 1)
+            if overlap > overlap_threshold:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            selected_windows.append(window_frames)
+            logger.info(f"  LC window {len(selected_windows)}: {len(window_frames)} frames, "
+                        f"regions [{region_i[0]}-{region_i[-1]}] + [{region_j[0]}-{region_j[-1]}], "
+                        f"dist={dist*100:.1f}cm, rot={rot_deg:.1f}°")
+
+    logger.info(f"Constructed {len(selected_windows)} loop closure windows")
+    return selected_windows
+
+
+# =============================================================================
 # Window Sampling & Edge Generation
 # =============================================================================
 
@@ -323,7 +456,7 @@ def generate_windows(seq_len, window_size, overlap=0.5):
 def generate_edges_for_window(
     model, dataset, seq_index, window_start, window_size,
     gt_poses, device, dtype, theseus_config, max_dt=None, global_scale=None,
-    training_style_sampling=False
+    training_style_sampling=False, frame_ids=None, no_scale=False
 ):
     """
     Generate STAR edges (anchor→i) for a single window with GT-based scale normalization.
@@ -332,8 +465,9 @@ def generate_edges_for_window(
     - Consecutive (i-1→i): Creates only dt=1 pairs, essentially an odometry chain
     - Star (anchor→i): Creates dt=1..S-1 pairs, enabling loop closures with overlapping windows
 
-    IMPORTANT: This matches the TRAINING semantic - uncertainty head was trained on
-    star constraints (T_rel_i = T_0^{-1} @ T_i), not consecutive constraints.
+    CONVENTION: Edges use C2W relative poses (Z = T_w2c_anchor @ T_w2c_i^{-1}).
+    This avoids the camera center distortion that occurs with w2c composition
+    (where T_0^{-1} @ T_i gives centers C_i + R_i^T @ t_0, a non-rigid error).
 
     Each window's predicted poses are scaled using GT translations before
     creating edges. This ensures all windows share a consistent scale when chaining
@@ -349,20 +483,30 @@ def generate_edges_for_window(
         device: torch device
         dtype: torch dtype
         theseus_config: {"order": ..., "weight_type": ...}
+        frame_ids: Optional list of specific frame indices to use (for loop closure
+                   windows with non-consecutive frames). Overrides window_start and
+                   training_style_sampling.
 
     Returns:
         List of edge dicts with 'from', 'to', 'measurement', 'information'
     """
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    # Get frames - either consecutive (PGO-style) or training-style (ids=None)
-    if training_style_sampling:
+    # Get frames - explicit frame_ids, training-style, or consecutive
+    if frame_ids is not None:
+        # Explicit frame IDs (e.g., loop closure windows with non-consecutive frames)
+        sampled_ids = list(frame_ids)
+        actual_window_size = len(sampled_ids)
+        batch = dataset.get_data(seq_index=seq_index, img_per_seq=actual_window_size, ids=sampled_ids, aspect_ratio=1.0)
+    elif training_style_sampling:
         # Use ids=None to let dataset sample frames with varied spacing (same as training)
+        actual_window_size = window_size
         batch = dataset.get_data(seq_index=seq_index, img_per_seq=window_size, ids=None, aspect_ratio=1.0)
         # Get the actual frame indices that were sampled
         sampled_ids = list(batch['ids'])
     else:
         # Consecutive frames (original PGO-style)
+        actual_window_size = window_size
         sampled_ids = list(range(window_start, window_start + window_size))
         batch = dataset.get_data(seq_index=seq_index, img_per_seq=window_size, ids=sampled_ids, aspect_ratio=1.0)
 
@@ -384,7 +528,7 @@ def generate_edges_for_window(
     pred_extri, _ = pose_encoding_to_extri_intri(pose_enc, image_size_hw=image_hw)  # [1, S, 3, 4], intrinsics
 
     # Make 4x4 matrices (use float32 for matrix operations)
-    T_abs = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).expand(window_size, -1, -1).clone()
+    T_abs = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).expand(actual_window_size, -1, -1).clone()
     T_abs[:, :3, :] = pred_extri[0].float()  # [S, 4, 4]
 
     # Get GT poses for the sampled frames (use sampled_ids, not window_start range)
@@ -417,8 +561,11 @@ def generate_edges_for_window(
         gt_travel = gt_norm.sum().item()
         pred_travel = pred_norm.sum().item()
 
-    # Use global_scale if provided, otherwise use window_scale
-    if global_scale is not None:
+    # Use global_scale if provided, no_scale if requested, otherwise use window_scale
+    if no_scale:
+        scale = 1.0
+        logger.info(f"  Window {window_start}: no_scale=True (window_scale would be {window_scale:.3f})")
+    elif global_scale is not None:
         scale = global_scale
         logger.info(f"  Window {window_start}: using global_scale={scale:.3f} (window_scale would be {window_scale:.3f})")
     else:
@@ -437,22 +584,33 @@ def generate_edges_for_window(
     sigma_trans = torch.exp(0.5 * log_var[0, :, :3]).mean().item()
     gt_travel = gt_c.norm(dim=-1).sum().item()
     pred_travel = pred_c.norm(dim=-1).sum().item()
-    if training_style_sampling:
+    if frame_ids is not None:
+        frame_span = sampled_ids[-1] - sampled_ids[0]
+        logger.info(f"Window (LC): frames={sampled_ids[0]}-{sampled_ids[-1]} (span={frame_span}, {actual_window_size} frames), scale={scale:.3f}, gt_travel={gt_travel:.3f}m, σ_trans={sigma_trans:.4f}m")
+    elif training_style_sampling:
         frame_span = sampled_ids[-1] - sampled_ids[0]
         logger.info(f"Window (training_style): frames={sampled_ids[0]}-{sampled_ids[-1]} (span={frame_span}), scale={scale:.3f}, gt_travel={gt_travel:.3f}m, σ_trans={sigma_trans:.4f}m")
     else:
         logger.info(f"Window {window_start}: scale={scale:.3f}, gt_travel={gt_travel:.3f}m, pred_travel={pred_travel:.3f}m, σ_trans={sigma_trans:.4f}m")
 
-    # Create edges (STAR constraints: anchor → i)
-    # This matches training semantic: uncertainty was trained on T_rel = T_0^{-1} @ T_i
-    # Using scaled poses ensures consistent scale across windows
+    # Create edges (STAR constraints: anchor → i) using C2W convention
+    #
+    # WHY C2W: With w2c convention, composing T_0^{-1} @ T_i and then extracting
+    # camera centers via C = -R^T @ t gives C_distorted = C_i + R_i^T @ t_0 —
+    # a per-frame non-rigid distortion. With c2w convention, the translation column
+    # IS the camera center, giving correct R_root @ (C_i - C_root) after chaining.
+    #
+    # C2W relative pose: Z = T_c2w_anchor^{-1} @ T_c2w_i = T_w2c_anchor @ T_w2c_i^{-1}
+    # This is the inverse of the w2c relative pose (Z_c2w = Z_w2c^{-1}).
+    # For small errors, the Lie algebra error magnitudes are approximately equal,
+    # so the predicted uncertainty weights remain valid.
     edges = []
 
     # Use sampled_ids for global frame indices (handles both consecutive and training-style)
     anchor_global = sampled_ids[0]  # Anchor is first frame of window
-    T_anchor_inv = torch.inverse(T_abs_scaled[0])  # Inverse of anchor pose
+    T_anchor = T_abs_scaled[0]  # w2c anchor pose (used as T_c2w_anchor^{-1})
 
-    for i in range(1, window_size):
+    for i in range(1, actual_window_size):
         # Filter by max_dt if specified (use actual frame distance from sampled_ids)
         dt = abs(sampled_ids[i] - sampled_ids[0])  # actual frame distance
         if max_dt is not None and dt > max_dt:
@@ -460,12 +618,13 @@ def generate_edges_for_window(
 
         target_global = sampled_ids[i]  # Use actual sampled frame id
 
-        # Star relative pose: Z = T_anchor^{-1} @ T_i (anchor to target)
-        Z_star = T_anchor_inv @ T_abs_scaled[i]  # [4, 4]
+        # C2W star relative pose: Z = T_w2c_anchor @ T_w2c_i^{-1}
+        Z_star = T_anchor @ torch.inverse(T_abs_scaled[i])  # [4, 4]
 
-        # Use per-frame uncertainty directly (SEMANTICALLY CORRECT)
-        # The uncertainty head was trained for Log(T_rel_gt^{-1} @ T_rel_pred)
-        # where T_rel = T_0^{-1} @ T_i, so log_var[i] is the uncertainty for frame i
+        # Use per-frame uncertainty directly
+        # The uncertainty head was trained on w2c relative errors; for c2w edges
+        # (which are the inverse), the error magnitude is approximately the same
+        # for small rotations: ||Log(Z_c2w^{-1})||^2 ≈ ||Log(Z_w2c)||^2
         log_var_i = log_var[0, i]  # [6]
 
         # Adjust based on sanity test results
@@ -485,7 +644,23 @@ def generate_edges_for_window(
             'information': info,
         })
 
-    return edges, scale  # Also return the scale used/computed
+    # Per-window ATE evaluation (Sim3-aligned, independent of chaining)
+    pred_poses_34 = T_abs_scaled[:, :3, :].cpu().numpy()  # [S, 3, 4]
+    gt_poses_34 = gt_window[:, :3, :].cpu().numpy()  # [S, 3, 4]
+    per_window_ate = _compute_ate_impl(pred_poses_34, gt_poses_34, align='sim3',
+                                        gt_convention='w2c', pred_convention='w2c')
+
+    window_ate_info = {
+        'ate_trans': per_window_ate['trans_rmse'],
+        'ate_rot': per_window_ate['rot_rmse'],
+        'scale': per_window_ate['scale'],
+        'window_start': sampled_ids[0] if (frame_ids is not None or training_style_sampling) else window_start,
+        'aligned_positions': per_window_ate['aligned_positions'],  # [S, 3] Sim3-aligned pred centers
+        'gt_positions': per_window_ate['gt_positions'],  # [S, 3] GT centers
+        'frame_ids': sampled_ids,  # global frame IDs
+    }
+
+    return edges, scale, window_ate_info
 
 
 # =============================================================================
@@ -565,8 +740,12 @@ def initialize_poses_mst(edges):
 
     Handles duplicate edges by keeping the one with smallest dt.
 
+    CONVENTION: Edges and output poses use c2w convention. The translation column
+    of each output pose gives the correct camera center in the root's coordinate
+    frame: R_root @ (C_i - C_root). Convert to w2c via matrix inverse for evaluation.
+
     Returns:
-        Dict {node_id: SE3 tensor [4, 4]}
+        Dict {node_id: SE3 tensor [4, 4]} in c2w convention
     """
     import networkx as nx
 
@@ -744,7 +923,12 @@ def run_pgo_theseus(edges, initial_poses, weight_mode='predicted', log_var_mle=N
 
         if use_robust:
             # Wrap with Huber robust kernel
-            cost = th.RobustCostFunction(cost, th.HuberLoss, {"threshold": 1.0})
+            # log_loss_radius is log(threshold); threshold=1.0 → log=0.0
+            # flatten_dims=True required for Theseus vectorizer compatibility
+            log_radius = th.Variable(
+                tensor=torch.zeros(1), name=f"huber_radius_{idx}")
+            cost = th.RobustCostFunction(
+                cost, th.HuberLoss, log_radius, flatten_dims=True)
 
         objective.add(cost)
 
@@ -759,7 +943,9 @@ def run_pgo_theseus(edges, initial_poses, weight_mode='predicted', log_var_mle=N
         linear_solver_cls=linear_solver_cls,
     )
 
-    layer = th.TheseusLayer(optimizer)
+    # Disable vectorization when using robust kernels (Theseus vectorizer
+    # has shape mismatch bugs with RobustCostFunction's Jacobian rescaling)
+    layer = th.TheseusLayer(optimizer, vectorize=not use_robust)
 
     # Initial values (exclude the fixed root node)
     input_tensors = {f"pose_{i}": poses[i].tensor for i in node_ids if i != root_node}
@@ -952,13 +1138,16 @@ def compute_gt_residuals_theseus(edges, gt_poses):
     for e in edges:
         i, j = e['from'], e['to']
 
-        # GT poses as Theseus SE3 (3x4 format)
-        gt_i_34 = torch.from_numpy(gt_poses[i, :3, :]).unsqueeze(0).float()
-        gt_j_34 = torch.from_numpy(gt_poses[j, :3, :]).unsqueeze(0).float()
+        # GT poses must be in c2w convention to match c2w edge measurements
+        # GT from dataset is w2c, so invert to get c2w
+        gt_c2w_i = np.linalg.inv(gt_poses[i])
+        gt_c2w_j = np.linalg.inv(gt_poses[j])
+        gt_i_34 = torch.from_numpy(gt_c2w_i[:3, :]).unsqueeze(0).float()
+        gt_j_34 = torch.from_numpy(gt_c2w_j[:3, :]).unsqueeze(0).float()
         T_gt_i = th.SE3(tensor=gt_i_34)
         T_gt_j = th.SE3(tensor=gt_j_34)
 
-        # Measurement (predicted relative pose)
+        # Measurement (predicted c2w relative pose)
         meas_34 = e['measurement'][:3, :].unsqueeze(0).float()
         Z_pred = th.SE3(tensor=meas_34)
 
@@ -1261,6 +1450,8 @@ def main():
                         help='Max frame distance (dt) for edges. Limits to short baselines where uncertainty is more accurate.')
     parser.add_argument('--global_scale', action='store_true',
                         help='Use a single global scale (from first window) for all windows instead of per-window scales.')
+    parser.add_argument('--no_scale', action='store_true',
+                        help='Disable scale fitting entirely (scale=1.0). For scale isolation experiments.')
     parser.add_argument('--training_style', action='store_true',
                         help='Use training-style frame sampling (ids=None with get_nearby=True, varied spacing) instead of consecutive frames.')
     parser.add_argument('--oracle', action='store_true',
@@ -1271,6 +1462,23 @@ def main():
     parser.add_argument('--oracle_binned', action='store_true',
                         help='Oracle with binned covariance by dt. '
                              'Each dt bin uses empirical σ²(dt) = E[r²]. Best "upper bound" estimate.')
+    parser.add_argument('--rerun', action='store_true',
+                        help='Save Rerun visualization (.rrd) showing GT, per-window aligned, MST init, PGO result')
+    parser.add_argument('--loop_closure', action='store_true',
+                        help='Enable GT-based loop closure detection. Adds edges between '
+                             'spatially-close but temporally-distant frame groups.')
+    parser.add_argument('--lc_min_temporal_gap', type=int, default=100,
+                        help='Min frame distance for loop closure candidates (default: 100)')
+    parser.add_argument('--lc_spatial_threshold', type=float, default=0.3,
+                        help='Max camera center distance in meters for LC candidates (default: 0.3)')
+    parser.add_argument('--lc_max_rotation_deg', type=float, default=60.0,
+                        help='Max rotation angle in degrees between LC camera pairs (default: 60)')
+    parser.add_argument('--max_lc_windows', type=int, default=10,
+                        help='Maximum number of loop closure windows (default: 10)')
+    parser.add_argument('--weight_temperatures', type=str, default=None,
+                        help='Comma-separated temperature values for predicted weight sweep. '
+                             'α=1.0 is original, α<1 compresses dynamic range toward uniform. '
+                             'Example: --weight_temperatures 0.3,0.5,0.7,1.0')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1364,30 +1572,101 @@ def main():
         return
 
     # Generate edges (with GT-based scale normalization)
-    scale_mode = "global" if args.global_scale else "per-window"
+    scale_mode = "none" if args.no_scale else ("global" if args.global_scale else "per-window")
     dt_info = f", max_dt={args.max_dt}" if args.max_dt is not None else ""
     sampling_info = ", training_style" if args.training_style else ", consecutive"
     logger.info(f"Generating edges (scale={scale_mode}{dt_info}{sampling_info})...")
 
     all_edges = []
     global_scale_value = None
+    per_window_ates = []
 
     for w_idx, (w_start, _) in enumerate(windows):
-        edges, window_scale = generate_edges_for_window(
+        edges, window_scale, window_ate_info = generate_edges_for_window(
             model, dataset, seq_index, w_start, args.window_size,
             gt_poses, device, dtype, theseus_config,
             max_dt=args.max_dt,
             global_scale=global_scale_value if args.global_scale else None,
-            training_style_sampling=args.training_style
+            training_style_sampling=args.training_style,
+            no_scale=args.no_scale
         )
         all_edges.extend(edges)
+        per_window_ates.append(window_ate_info)
 
         # For global scale mode, capture scale from first window
         if args.global_scale and w_idx == 0:
             global_scale_value = window_scale
             logger.info(f"Using global scale from first window: {global_scale_value:.3f}")
 
-    logger.info(f"Total edges: {len(all_edges)}")
+    # Report per-window ATE statistics
+    pw_trans = [w['ate_trans'] for w in per_window_ates]
+    pw_rot = [w['ate_rot'] for w in per_window_ates]
+    pw_scale = [w['scale'] for w in per_window_ates]
+    logger.info(f"\nPer-Window ATE (Sim3-aligned, {len(per_window_ates)} windows):")
+    logger.info(f"  Trans RMSE: mean={np.mean(pw_trans)*100:.2f} cm, median={np.median(pw_trans)*100:.2f} cm, "
+                f"p95={np.percentile(pw_trans, 95)*100:.2f} cm")
+    logger.info(f"  Rot RMSE:   mean={np.mean(pw_rot):.2f}°, median={np.median(pw_rot):.2f}°, "
+                f"p95={np.percentile(pw_rot, 95):.2f}°")
+    logger.info(f"  Sim3 Scale: mean={np.mean(pw_scale):.3f}, std={np.std(pw_scale):.3f}, "
+                f"range=[{np.min(pw_scale):.3f}, {np.max(pw_scale):.3f}]")
+
+    num_sequential_edges = len(all_edges)
+    logger.info(f"Sequential edges: {num_sequential_edges}")
+
+    # =========================================================================
+    # Loop Closure Edges (GT-based detection)
+    # =========================================================================
+    lc_windows_used = []
+    if args.loop_closure:
+        logger.info(f"\n{'='*60}")
+        logger.info("Loop Closure Detection (GT-based)")
+        logger.info(f"{'='*60}")
+
+        # Find candidates
+        lc_candidates = find_loop_closure_candidates(
+            gt_poses,
+            min_temporal_gap=args.lc_min_temporal_gap,
+            spatial_threshold=args.lc_spatial_threshold,
+            max_rotation_deg=args.lc_max_rotation_deg,
+        )
+
+        if lc_candidates:
+            # Construct LC windows
+            lc_windows = construct_loop_closure_windows(
+                lc_candidates, seq_len,
+                window_size=args.window_size,
+                max_lc_windows=args.max_lc_windows,
+            )
+            lc_windows_used = lc_windows
+
+            # Generate edges for each LC window
+            num_lc_edges = 0
+            for lc_idx, lc_frame_ids in enumerate(lc_windows):
+                logger.info(f"\nLC window {lc_idx + 1}/{len(lc_windows)}:")
+                lc_edges, lc_scale, lc_ate_info = generate_edges_for_window(
+                    model, dataset, seq_index, 0, len(lc_frame_ids),
+                    gt_poses, device, dtype, theseus_config,
+                    max_dt=None,  # No dt filter for LC edges (frames are far apart)
+                    global_scale=global_scale_value if args.global_scale else None,
+                    frame_ids=lc_frame_ids,
+                    no_scale=args.no_scale,
+                )
+                all_edges.extend(lc_edges)
+                per_window_ates.append(lc_ate_info)
+                num_lc_edges += len(lc_edges)
+
+            logger.info(f"\nLoop closure summary: {len(lc_windows)} windows, "
+                        f"{num_lc_edges} LC edges added to {num_sequential_edges} sequential edges")
+            # Log temporal gaps of LC windows
+            for lc_idx, lc_frame_ids in enumerate(lc_windows):
+                temporal_gap = lc_frame_ids[-1] - lc_frame_ids[0]
+                logger.info(f"  LC window {lc_idx + 1}: {len(lc_frame_ids)} frames, "
+                            f"span={temporal_gap}, range=[{lc_frame_ids[0]}, {lc_frame_ids[-1]}]")
+        else:
+            logger.info("No loop closure candidates found.")
+
+    logger.info(f"Total edges: {len(all_edges)} "
+                f"({num_sequential_edges} sequential + {len(all_edges) - num_sequential_edges} LC)")
 
     # Graph structure diagnostics
     print_graph_diagnostics(all_edges)
@@ -1436,6 +1715,16 @@ def main():
         weight_modes.append('oracle_binned')
         logger.info("Oracle binned mode enabled: per-dt-bin empirical covariance")
 
+    # Temperature sweep: add predicted_αX modes
+    temp_values = []
+    if args.weight_temperatures:
+        temp_values = [float(t) for t in args.weight_temperatures.split(',')]
+        for alpha in temp_values:
+            mode_name = f"predicted_a{alpha:.1f}"
+            if mode_name not in weight_modes:
+                weight_modes.append(mode_name)
+        logger.info(f"Temperature sweep enabled: α = {temp_values}")
+
     for mode in weight_modes:
         logger.info(f"\n{'='*60}")
         logger.info(f"Running PGO with {mode} weights...")
@@ -1448,9 +1737,24 @@ def main():
         elif mode == 'oracle_binned':
             mode_oracle_info = {'oracle_weights': oracle_info['oracle_weights_binned']}
 
+        # Temperature: create tempered edges for predicted_αX modes
+        pgo_edges = all_edges
+        actual_mode = mode
+        if mode.startswith('predicted_a'):
+            alpha = float(mode.split('_a')[1])
+            # Temper: info_tempered = info^α (compresses dynamic range for α<1)
+            # info is sqrt_lambda, so info^α = exp(-0.5*α*log_var)
+            pgo_edges = []
+            for e in all_edges:
+                tempered = dict(e)
+                tempered['information'] = e['information'] ** alpha
+                pgo_edges.append(tempered)
+            actual_mode = 'predicted'
+            logger.info(f"  Temperature α={alpha}: info^α compresses dynamic range")
+
         optimized_poses, pgo_info = run_pgo_theseus(
-            all_edges, initial_poses,
-            weight_mode=mode,
+            pgo_edges, initial_poses,
+            weight_mode=actual_mode,
             log_var_mle=log_var_mle,
             theseus_config=theseus_config,
             use_robust=args.robust,
@@ -1466,34 +1770,28 @@ def main():
             num_opt_frames = len(optimized_poses)
             gt_subset = gt_poses[:num_opt_frames]
 
-            # Try both conventions
-            # w2c: C = -R.T @ t
-            gt_centers_w2c = np.array([-p[:3, :3].T @ p[:3, 3] for p in gt_subset])
-            pred_centers_w2c = np.array([-p[:3, :3].T @ p[:3, 3] for p in opt_array[:num_opt_frames]])
-            # c2w: C = t directly
-            gt_centers_c2w = np.array([p[:3, 3] for p in gt_subset])
-            pred_centers_c2w = np.array([p[:3, 3] for p in opt_array[:num_opt_frames]])
+            # GT centers from w2c convention
+            gt_centers = np.array([-p[:3, :3].T @ p[:3, 3] for p in gt_subset])
+            # PGO output is c2w — camera center = translation column
+            pred_centers = np.array([p[:3, 3] for p in opt_array[:num_opt_frames]])
 
             logger.info(f"\nTrajectory Stats (before alignment):")
-            logger.info(f"  GT (w2c) span: x=[{gt_centers_w2c[:,0].min():.2f}, {gt_centers_w2c[:,0].max():.2f}], "
-                       f"y=[{gt_centers_w2c[:,1].min():.2f}, {gt_centers_w2c[:,1].max():.2f}], "
-                       f"z=[{gt_centers_w2c[:,2].min():.2f}, {gt_centers_w2c[:,2].max():.2f}]")
-            logger.info(f"  Pred (w2c) span: x=[{pred_centers_w2c[:,0].min():.2f}, {pred_centers_w2c[:,0].max():.2f}], "
-                       f"y=[{pred_centers_w2c[:,1].min():.2f}, {pred_centers_w2c[:,1].max():.2f}], "
-                       f"z=[{pred_centers_w2c[:,2].min():.2f}, {pred_centers_w2c[:,2].max():.2f}]")
-            logger.info(f"  GT (c2w) span: x=[{gt_centers_c2w[:,0].min():.2f}, {gt_centers_c2w[:,0].max():.2f}], "
-                       f"y=[{gt_centers_c2w[:,1].min():.2f}, {gt_centers_c2w[:,1].max():.2f}], "
-                       f"z=[{gt_centers_c2w[:,2].min():.2f}, {gt_centers_c2w[:,2].max():.2f}]")
-            logger.info(f"  Pred (c2w) span: x=[{pred_centers_c2w[:,0].min():.2f}, {pred_centers_c2w[:,0].max():.2f}], "
-                       f"y=[{pred_centers_c2w[:,1].min():.2f}, {pred_centers_c2w[:,1].max():.2f}], "
-                       f"z=[{pred_centers_c2w[:,2].min():.2f}, {pred_centers_c2w[:,2].max():.2f}]")
-            logger.info(f"  GT (w2c) travel: {np.sum(np.linalg.norm(np.diff(gt_centers_w2c, axis=0), axis=1)):.2f} m")
-            logger.info(f"  Pred (w2c) travel: {np.sum(np.linalg.norm(np.diff(pred_centers_w2c, axis=0), axis=1)):.2f} m")
+            logger.info(f"  GT span: x=[{gt_centers[:,0].min():.2f}, {gt_centers[:,0].max():.2f}], "
+                       f"y=[{gt_centers[:,1].min():.2f}, {gt_centers[:,1].max():.2f}], "
+                       f"z=[{gt_centers[:,2].min():.2f}, {gt_centers[:,2].max():.2f}]")
+            logger.info(f"  Pred (c2w) span: x=[{pred_centers[:,0].min():.2f}, {pred_centers[:,0].max():.2f}], "
+                       f"y=[{pred_centers[:,1].min():.2f}, {pred_centers[:,1].max():.2f}], "
+                       f"z=[{pred_centers[:,2].min():.2f}, {pred_centers[:,2].max():.2f}]")
+            logger.info(f"  GT travel: {np.sum(np.linalg.norm(np.diff(gt_centers, axis=0), axis=1)):.2f} m")
+            logger.info(f"  Pred travel: {np.sum(np.linalg.norm(np.diff(pred_centers, axis=0), axis=1)):.2f} m")
 
         # Evaluate using tested implementations (expects [N, 3, 4] poses, w2c convention)
         # Note: opt_array may cover only a subset of frames (when using --max_windows)
+        # PGO poses are in c2w convention — convert to w2c via matrix inverse
+        # This gives correct camera centers: C = -R^T @ t = R_root @ (C_i - C_root)
         num_opt_frames = len(optimized_poses)
-        pred_poses_34 = opt_array[:num_opt_frames, :3, :]  # [N, 3, 4]
+        opt_w2c = np.linalg.inv(opt_array[:num_opt_frames])
+        pred_poses_34 = opt_w2c[:, :3, :]  # [N, 3, 4]
         gt_poses_34 = gt_poses[:num_opt_frames, :3, :]     # [N, 3, 4]
 
         # Use Sim3 alignment from tested implementation
@@ -1509,6 +1807,8 @@ def main():
             'objective': pgo_info['objective'],
             'init_objective': pgo_info['init_objective'],
             'scale': ate_result['scale'],
+            'opt_array': opt_array,  # for Rerun visualization
+            'num_opt_frames': num_opt_frames,
         }
 
         logger.info(f"  ATE Trans: {ate_result['trans_rmse']*100:.2f} cm")
@@ -1519,9 +1819,11 @@ def main():
         logger.info(f"  Objective: {pgo_info['objective']:.4f}")
 
     # Also evaluate init poses using tested implementation
+    # Init poses are also in c2w convention — convert to w2c
     num_init_frames = len(initial_poses)
     init_array = poses_dict_to_array(initial_poses)
-    init_poses_34 = init_array[:num_init_frames, :3, :]  # [N, 3, 4]
+    init_w2c = np.linalg.inv(init_array[:num_init_frames])
+    init_poses_34 = init_w2c[:, :3, :]  # [N, 3, 4]
     init_gt_34 = gt_poses[:num_init_frames, :3, :]  # [N, 3, 4]
     init_ate_result = _compute_ate_impl(init_poses_34, init_gt_34, align='sim3',
                                          gt_convention='w2c', pred_convention='w2c')
@@ -1553,6 +1855,142 @@ def main():
             print("\n✓ SUCCESS: PGO + Predicted < PGO + Uniform (ATE)")
         else:
             print("\n✗ FAIL: PGO + Predicted >= PGO + Uniform (ATE)")
+
+    # =========================================================================
+    # Rerun Visualization
+    # =========================================================================
+    if args.rerun:
+        save_rerun_visualization(
+            gt_poses, initial_poses, results, per_window_ates, args,
+            lc_windows=lc_windows_used)
+
+
+def save_rerun_visualization(gt_poses, initial_poses, results, per_window_ates, args,
+                              lc_windows=None):
+    """Save Rerun visualization with timeline-based per-window display.
+
+    GT, MST init, and PGO trajectories are logged at every timeline step
+    so they remain visible. Per-window aligned trajectories appear one at a
+    time as you scrub through the 'window_idx' timeline.
+
+    LC windows are shown as distinct-colored line segments connecting the
+    two visit regions.
+    """
+    import rerun as rr
+    from eval_vggt_tum import extract_camera_positions, umeyama_alignment
+
+    rr_path = os.path.join(args.output_dir, "pgo_viz.rrd")
+    rr.init("pgo_eval", spawn=False)
+    rr.save(rr_path)
+
+    # Colors
+    BLUE = [50, 100, 255]       # GT
+    MAGENTA = [255, 0, 180]     # MST init
+    GREEN = [50, 200, 50]       # PGO uniform
+    ORANGE = [255, 165, 0]      # PGO predicted
+    PURPLE = [180, 50, 255]     # PGO oracle
+    WINDOW_COLORS = [
+        [255, 80, 80],    # red
+        [255, 200, 0],    # yellow
+        [0, 200, 200],    # cyan
+        [200, 120, 50],   # brown
+        [100, 255, 100],  # lime
+        [255, 100, 200],  # pink
+        [150, 150, 255],  # light blue
+    ]
+
+    # Pre-compute persistent entities (GT, MST init, PGO)
+    num_frames = max(w['frame_ids'][-1] for w in per_window_ates) + 1
+    num_frames = min(num_frames, len(gt_poses))
+    gt_centers = extract_camera_positions(gt_poses[:num_frames, :3, :], 'w2c')
+
+    init_array = poses_dict_to_array(initial_poses)
+    num_init = len(initial_poses)
+    init_centers = np.array([init_array[i, :3, 3] for i in range(num_init)])
+    gt_centers_init = extract_camera_positions(gt_poses[:num_init, :3, :], 'w2c')
+    R_init, t_init, s_init = umeyama_alignment(gt_centers_init, init_centers, with_scale=True)
+    init_aligned = s_init * (init_centers @ R_init.T) + t_init
+
+    pgo_colors = {'uniform': GREEN, 'predicted': ORANGE, 'oracle_isotropic': PURPLE}
+    pgo_data = {}
+    for mode, r in results.items():
+        if 'opt_array' not in r:
+            continue
+        opt_arr = r['opt_array']
+        num_opt = r['num_opt_frames']
+        opt_centers = np.array([opt_arr[i, :3, 3] for i in range(num_opt)])
+        gt_centers_opt = extract_camera_positions(gt_poses[:num_opt, :3, :], 'w2c')
+        R_opt, t_opt, s_opt = umeyama_alignment(gt_centers_opt, opt_centers, with_scale=True)
+        opt_aligned = s_opt * (opt_centers @ R_opt.T) + t_opt
+        pgo_data[mode] = opt_aligned
+
+    # Log per-window on timeline; re-log persistent entities at each step
+    num_windows = len(per_window_ates)
+    for w_idx in range(num_windows):
+        rr.set_time("window_idx", sequence=w_idx)
+
+        # Persistent: GT
+        rr.log("gt/trajectory", rr.LineStrips3D([gt_centers], colors=[BLUE], radii=0.002))
+        rr.log("gt/start", rr.Points3D([gt_centers[0]], colors=[[0, 255, 0]], radii=0.01))
+
+        # Persistent: MST init
+        rr.log("mst_init/trajectory", rr.LineStrips3D([init_aligned], colors=[MAGENTA], radii=0.002))
+        rr.log("mst_init/points", rr.Points3D(init_aligned[::8], colors=[MAGENTA], radii=0.004))
+
+        # Persistent: PGO results
+        for mode, opt_aligned in pgo_data.items():
+            color = pgo_colors.get(mode, [255, 230, 0])
+            rr.log(f"pgo_{mode}/trajectory", rr.LineStrips3D([opt_aligned], colors=[color], radii=0.002))
+            rr.log(f"pgo_{mode}/points", rr.Points3D(opt_aligned[::8], colors=[color], radii=0.004))
+
+        # Per-window: only current window's aligned trajectory
+        w_info = per_window_ates[w_idx]
+        color = WINDOW_COLORS[w_idx % len(WINDOW_COLORS)]
+        aligned = w_info['aligned_positions']
+        frame_ids = w_info['frame_ids']
+        w_start = frame_ids[0]
+        rr.log("current_window/trajectory",
+               rr.LineStrips3D([aligned], colors=[color], radii=0.003))
+        rr.log("current_window/start",
+               rr.Points3D([aligned[0]], colors=[color], radii=0.008))
+        # Highlight the GT segment this window covers
+        gt_segment = gt_centers[frame_ids[0]:frame_ids[-1]+1]
+        rr.log("current_window/gt_segment",
+               rr.LineStrips3D([gt_segment], colors=[color], radii=0.003))
+
+    # Log loop closure connections on GT trajectory
+    LC_COLOR = [255, 50, 50]  # Bright red for LC edges
+    if lc_windows and len(gt_centers) > 0:
+        lc_segments = []
+        for lc_frame_ids in lc_windows:
+            if len(lc_frame_ids) >= 2:
+                # Connect first-visit center to revisit center
+                # Use midpoints of each half as representative points
+                half = len(lc_frame_ids) // 2
+                first_half = lc_frame_ids[:half]
+                second_half = lc_frame_ids[half:]
+                mid_first = first_half[len(first_half) // 2]
+                mid_second = second_half[len(second_half) // 2]
+                if mid_first < len(gt_centers) and mid_second < len(gt_centers):
+                    lc_segments.append([gt_centers[mid_first], gt_centers[mid_second]])
+
+        if lc_segments:
+            # Log at every timeline step so LC edges are always visible
+            for w_idx in range(num_windows):
+                rr.set_time("window_idx", sequence=w_idx)
+                rr.log("loop_closure/edges",
+                       rr.LineStrips3D(lc_segments, colors=[LC_COLOR] * len(lc_segments),
+                                       radii=0.003))
+                # Also show LC connection points
+                lc_points = []
+                for seg in lc_segments:
+                    lc_points.extend(seg)
+                rr.log("loop_closure/points",
+                       rr.Points3D(lc_points, colors=[LC_COLOR] * len(lc_points),
+                                   radii=0.008))
+
+    print(f"\nRerun visualization saved to: {rr_path}")
+    print(f"  Open with: rerun {rr_path}")
 
 
 if __name__ == '__main__':

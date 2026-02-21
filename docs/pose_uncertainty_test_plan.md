@@ -1812,6 +1812,38 @@ Laplace's heavier tails provide slightly better PGO performance despite lower Sp
 
 ---
 
+## Phase 5.11: Drift Analysis — ATE vs. Sequence Length (fr1_desk)
+
+After fixing the camera center distortion bug (c2w convention fix in edge generation), we measured how drift accumulates as the number of windows increases. Setup: window_size=16, overlap=50%, global_scale from first window.
+
+### Results
+
+| Windows | Frames | Init ATE (trans) | Init ATE (rot) | PGO+uniform (trans) | PGO+predicted (trans) | RPE (trans) |
+|---------|--------|-----------------|----------------|--------------------|-----------------------|-------------|
+| 5       | 48     | 2.42 cm         | 1.38°          | 2.23 cm            | 2.22 cm               | 0.98 cm     |
+| 10      | 88     | 1.52 cm         | 2.44°          | 1.39 cm            | 1.39 cm               | 0.96 cm     |
+| 30      | 248    | 4.43 cm         | 5.22°          | 4.17 cm            | 4.16 cm               | 1.08 cm     |
+| 50      | 408    | 17.20 cm        | 3.77°          | 17.54 cm           | 17.58 cm              | 1.12 cm     |
+| 74 (full)| 596   | 31.44 cm        | 15.51°         | 30.64 cm           | 30.75 cm              | 1.48 cm     |
+
+### Key Observations
+
+1. **RPE remains small (~1 cm)** across all sequence lengths — local relative pose estimation is accurate
+2. **ATE grows superlinearly** with sequence length — classic drift accumulation from sequential chaining
+3. **PGO provides marginal improvement** without loop closures (at most ~1 cm reduction)
+4. **Predicted vs uniform weights are nearly identical** — without loop closures, all edges are similar quality so weighting provides little benefit
+5. **Root cause**: No loop closure edges in the pose graph. Only consecutive/overlapping windows contribute edges, so drift is never corrected
+
+### Implication
+
+**Loop closure is essential** for long-sequence accuracy. The pose uncertainty head's value will be most apparent when:
+- Loop closure edges are added (uncertainty can down-weight false/noisy loops)
+- Heterogeneous edge quality exists (mix of good sequential edges + potentially noisy loop edges)
+
+This motivates Phase 6: adding loop closure detection (e.g., via VGGT attention layer 22, per VGGT-SLAM 2.0) and demonstrating uncertainty-weighted PGO benefit.
+
+---
+
 ## Phase 6: Scale to Full TUM RGB-D
 
 Once smoke test passes on `freiburg1_desk`, scale up to all TUM sequences.
@@ -1973,6 +2005,73 @@ Retrain with augmented data (consecutive windows + varied spacing) - see Phase 5
 
 ---
 
+### Phase 5.12: Loop Closure Experiment
+
+**Motivation:** ATE grows from ~2cm (5 windows) to ~31cm (full 596-frame fr1_desk) due to drift accumulation in the sequential sliding window approach. Loop closure edges connecting revisit regions should correct drift, and better demonstrate the value of uncertainty-weighted PGO (predicted weights should downweight noisy LC edges more than uniform weights can).
+
+**Approach:** GT-based loop closure detection:
+1. Extract GT camera centers and find spatially-close but temporally-distant frame pairs
+2. Also check camera attitude similarity (rotation angle < threshold) to ensure frustum overlap
+3. Construct mixed windows with frames from both first-visit and revisit regions
+4. Run VGGT on these windows to get relative poses + uncertainties
+5. Add resulting edges to the pose graph before PGO
+
+**Command:**
+```bash
+export HF_HUB_OFFLINE=1 && python training/tests/eval_pgo_uncertainty.py \
+    --tum_dir /home/yiming/Dev/tum_rgbd \
+    --tum_sequence rgbd_dataset_freiburg1_desk \
+    --uncertainty_checkpoint ./checkpoints_aug/best.pt \
+    --window_size 16 --overlap 0.5 --global_scale \
+    --loop_closure --rerun \
+    --output_dir ./eval_pgo_lc/fr1_desk
+```
+
+**CLI arguments:**
+- `--loop_closure`: Enable GT-based loop closure
+- `--lc_min_temporal_gap N`: Min frame distance (default: 100)
+- `--lc_spatial_threshold X`: Max distance in meters (default: 0.3)
+- `--lc_max_rotation_deg X`: Max viewing direction difference in degrees (default: 60)
+- `--max_lc_windows N`: Max LC windows (default: 10)
+
+**Expected:** ATE drops significantly from ~31cm. PGO+predicted outperforms PGO+uniform more clearly with LC edges.
+
+**Results (fr1_desk, ws=16, overlap=0.5, global_scale, robust kernel):**
+
+Loop closure detection found 4,615 candidates (gap>100, dist<0.3m, rot<60°), selected 10 LC windows after deduplication, adding 150 LC edges to 1,110 sequential edges (1,260 total). LC windows span 220–467 frames, with revisit distances as close as 3.5cm.
+
+| Method | ATE Trans | ATE Rot | RPE Trans | RPE Rot |
+|--------|-----------|---------|-----------|---------|
+| Before PGO (MST init) | 31.55 cm | 15.41° | 1.48 cm | 0.59° |
+| PGO + uniform (robust) | **15.54 cm** | 6.69° | 1.34 cm | 0.55° |
+| PGO + predicted (robust) | 15.69 cm | **6.53°** | **1.29 cm** | **0.54°** |
+
+Comparison with previous results (no loop closure, from Phase 5.9.10):
+
+| Config | ATE (uniform) | ATE (predicted) |
+|--------|---------------|-----------------|
+| No LC (ws=16) | 38.89 cm | 38.80 cm |
+| **With LC (ws=16)** | **15.54 cm** | **15.69 cm** |
+
+**Key Findings:**
+
+1. **Loop closure halved drift:** ATE dropped from ~39cm → ~15.5cm (60% reduction). The 150 LC edges spanning 220–467 frames provide strong long-range constraints that PGO uses to correct accumulated drift.
+
+2. **Predicted does not beat uniform on ATE**, but wins on rotation ATE (6.53° vs 6.69°) and RPE (1.29cm vs 1.34cm, 0.54° vs 0.55°). The uncertainty head provides value for local relative accuracy but not global trajectory.
+
+3. **Uncertainty is overconfident for large baselines:** d² calibration shows d²_trans=9.22 (expect 3.0), growing with dt: dt=1-4 → d²=3.8, dt=5-8 → d²=9.4, dt=9-16 → d²=17.5. The uncertainty head underestimates σ because it was trained on a narrow distribution of visual patterns (varied spacing ~30 frame span + consecutive windows). The two-cluster structure of LC windows (8 frames from each visit region) is out-of-distribution.
+
+4. **Robust kernel helps marginally:** Huber loss improved predicted ATE from 15.72→15.69cm and rotation from 6.62→6.53°. The overconfidence is systematic (not just outliers), so Huber cannot fully compensate.
+
+**Root Cause of predicted < uniform gap:**
+VGGT is a vision model (no timestamp input), so large dt should not inherently mean large error — what matters is visual overlap. However, the uncertainty head was trained on windows sampled from a narrow distribution (varied spacing within ±16 frames, or consecutive). LC windows present an out-of-distribution structure (two disjoint temporal clusters), and the head has not learned to be appropriately uncertain about unfamiliar input patterns.
+
+**Next Steps:**
+- Retrain uncertainty head with LC-like windows (two-cluster sampling) to improve calibration on loop closure edges
+- Consider dt-dependent σ floor as a lightweight calibration correction
+
+---
+
 ## Expected Timeline
 
 | Phase | Status | Description | Results |
@@ -1987,6 +2086,7 @@ Retrain with augmented data (consecutive windows + varied spacing) - see Phase 5
 | Phase 5.9.10 | Done | Consecutive window eval | Spearman 0.67-0.74, PGO+Pred beats Uniform by ~1%. See [§5.9.10](#phase-5910-consecutive-window-pgo-evaluation-results) |
 | Phase 5.10 | Done | Augmented data training | Spearman 0.742 (ws=16), oracle upper bound 38.57cm. See [§5.10.8](#5108-augmented-training-results) |
 | Phase 5.10.9 | Done | Laplace NLL ablation | Laplace ATE 38.77 < Gaussian 38.82. See [§5.10.9](#5109-laplace-nll-ablation-results) |
+| Phase 5.12 | Done | Loop closure experiment | LC halved drift (39→15.5cm). Predicted wins RPE/rot, not ATE (overconfident σ). See [§5.12](#phase-512-loop-closure-experiment) |
 | Phase 6 (Benchmark P1) | Done | Multi-sequence TUM | 6 train / 4 eval seqs. Spearman 0.69–0.86 on held-out. PGO 1/4. See [benchmark plan](pose_uncertainty_benchmark_plan.md) |
 
 **Detailed Results:**

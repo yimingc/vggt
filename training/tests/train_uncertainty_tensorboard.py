@@ -7,6 +7,7 @@ Train the pose uncertainty head with logging for visualization.
 Supports augmented data sampling:
 - Original: varied spacing (ids=None with get_nearby=True)
 - Consecutive: fixed window sizes (8, 16, 32, 64) with 50% overlap
+- Two-cluster: two temporally separated frame groups (mimics loop closure windows)
 
 Usage:
     # TensorBoard only:
@@ -149,7 +150,7 @@ class MockCommonConf:
 
 class AugmentedDataSampler:
     """
-    Sampler that mixes varied-spacing and consecutive window sampling.
+    Sampler that mixes varied-spacing, consecutive window, and two-cluster sampling.
 
     Sampling strategies:
     1. Varied spacing (original): ids=None with get_nearby=True
@@ -160,20 +161,26 @@ class AugmentedDataSampler:
        - Window sizes: 8, 16, 32, 64 frames
        - Overlap: 50% between adjacent windows
        - Good for learning uncertainty at different scales
+
+    3. Two-cluster (GT-pose-guided): two temporally separated but spatially
+       close groups of frames, mimicking real loop closure windows.
+       Uses GT camera poses to find revisited locations.
     """
 
     def __init__(self, dataset, window_sizes=[8, 16, 32, 64],
-                 consecutive_ratio=0.5, seed=42):
+                 consecutive_ratio=0.5, two_cluster_ratio=0.0, seed=42):
         """
         Args:
             dataset: TUMRGBDDataset instance
             window_sizes: List of window sizes for consecutive sampling
             consecutive_ratio: Probability of using consecutive sampling (0-1)
+            two_cluster_ratio: Probability of using two-cluster sampling (0-1)
             seed: Random seed for reproducibility
         """
         self.dataset = dataset
         self.window_sizes = window_sizes
         self.consecutive_ratio = consecutive_ratio
+        self.two_cluster_ratio = two_cluster_ratio
         self.rng = np.random.RandomState(seed)
 
         # Pre-compute sequence lengths for consecutive sampling
@@ -195,11 +202,91 @@ class AugmentedDataSampler:
                 for start in range(0, seq_len - window_size + 1, step):
                     self.consecutive_windows.append((seq_idx, start, window_size))
 
+        # Pre-compute GT-pose-guided loop closure pairs per sequence.
+        # Find frame pairs that are temporally distant but spatially close.
+        lc_min_gap = 100  # minimum temporal gap (frames)
+        lc_max_dist = 0.5  # max spatial distance (meters) for LC candidate
+        half_max = max(window_sizes) // 2  # largest half-window we need
+
+        self.lc_pairs = []  # list of (seq_idx, frame_i, frame_j)
+        for seq_idx in range(len(dataset.sequence_list)):
+            seq_name = dataset.sequence_list[seq_idx]
+            frames = dataset.data_store[seq_name]
+            seq_len = len(frames)
+
+            # Extract camera centers from GT w2c extrinsics: C = -R^T @ t
+            centers = np.zeros((seq_len, 3))
+            for i, frame in enumerate(frames):
+                ext = frame['extrinsic']  # 3x4 w2c
+                R = ext[:3, :3]
+                t = ext[:3, 3]
+                centers[i] = -R.T @ t
+
+            # Find LC pairs: temporal gap > lc_min_gap, spatial dist < lc_max_dist
+            # Subsample to avoid O(n²) explosion: check every 4th frame as anchor
+            for i in range(half_max, seq_len - half_max, 4):
+                for j in range(i + lc_min_gap, seq_len - half_max):
+                    dist = np.linalg.norm(centers[i] - centers[j])
+                    if dist < lc_max_dist:
+                        self.lc_pairs.append((seq_idx, i, j))
+
         logger.info(f"AugmentedDataSampler initialized:")
         logger.info(f"  - Window sizes: {window_sizes}")
         logger.info(f"  - Consecutive ratio: {consecutive_ratio}")
+        logger.info(f"  - Two-cluster ratio: {two_cluster_ratio}")
         logger.info(f"  - Total consecutive windows: {len(self.consecutive_windows)}")
         logger.info(f"    - By size: {dict((ws, sum(1 for w in self.consecutive_windows if w[2]==ws)) for ws in window_sizes)}")
+        logger.info(f"  - GT-guided LC pairs: {len(self.lc_pairs)} "
+                     f"(gap>{lc_min_gap}, dist<{lc_max_dist}m)")
+
+    def _sample_two_cluster(self):
+        """Sample a GT-pose-guided two-cluster window.
+
+        Picks a pair of frames that are temporally distant but spatially close
+        (a real loop closure), then builds two clusters of consecutive frames
+        around them.
+
+        Returns:
+            dict with sampling info, or None if no valid LC pairs.
+        """
+        if not self.lc_pairs:
+            return None
+
+        # Pick random LC pair
+        idx = self.rng.randint(len(self.lc_pairs))
+        seq_idx, center_i, center_j = self.lc_pairs[idx]
+        seq_len = self.seq_lengths[seq_idx]
+
+        # Pick random window size
+        window_size = self.window_sizes[self.rng.randint(len(self.window_sizes))]
+        half = window_size // 2
+
+        # Build cluster A centered on center_i, cluster B centered on center_j
+        # Add random jitter to avoid always centering exactly on the LC frame
+        max_jitter = half // 2
+        jitter_i = self.rng.randint(-max_jitter, max_jitter + 1)
+        jitter_j = self.rng.randint(-max_jitter, max_jitter + 1)
+
+        start1 = center_i - half // 2 + jitter_i
+        start2 = center_j - half // 2 + jitter_j
+
+        # Clamp to valid range
+        start1 = max(0, min(start1, seq_len - half))
+        start2 = max(0, min(start2, seq_len - half))
+
+        # Ensure clusters don't overlap
+        if start1 + half > start2:
+            return None
+
+        ids = sorted(list(range(start1, start1 + half)) + list(range(start2, start2 + half)))
+
+        return {
+            'seq_idx': seq_idx,
+            'ids': ids,
+            'num_frames': window_size,
+            'sampling_type': 'two_cluster',
+            'window_size': window_size,
+        }
 
     def sample(self, iteration):
         """
@@ -210,35 +297,42 @@ class AugmentedDataSampler:
                 - 'seq_idx': sequence index
                 - 'ids': frame indices (list or None)
                 - 'num_frames': number of frames
-                - 'sampling_type': 'varied' or 'consecutive'
-                - 'window_size': window size (for consecutive)
+                - 'sampling_type': 'varied', 'consecutive', or 'two_cluster'
+                - 'window_size': window size
         """
-        use_consecutive = self.rng.rand() < self.consecutive_ratio
+        rand_val = self.rng.rand()
 
-        if use_consecutive and len(self.consecutive_windows) > 0:
-            # Sample a random consecutive window
-            idx = self.rng.randint(len(self.consecutive_windows))
-            seq_idx, start, window_size = self.consecutive_windows[idx]
-            ids = list(range(start, start + window_size))
-            return {
-                'seq_idx': seq_idx,
-                'ids': ids,
-                'num_frames': window_size,
-                'sampling_type': 'consecutive',
-                'window_size': window_size,
-            }
-        else:
-            # Use varied spacing (original method with ids=None)
-            seq_idx = iteration % len(self.dataset.sequence_list)
-            # Default to 8 frames for varied spacing
-            num_frames = 8
-            return {
-                'seq_idx': seq_idx,
-                'ids': None,  # Let dataset handle sampling
-                'num_frames': num_frames,
-                'sampling_type': 'varied',
-                'window_size': num_frames,
-            }
+        # Three-way split: two_cluster, then consecutive, then varied
+        if rand_val < self.two_cluster_ratio:
+            result = self._sample_two_cluster()
+            if result is not None:
+                return result
+            # Fall through to varied if two-cluster fails
+
+        if rand_val < self.two_cluster_ratio + self.consecutive_ratio:
+            if len(self.consecutive_windows) > 0:
+                # Sample a random consecutive window
+                idx = self.rng.randint(len(self.consecutive_windows))
+                seq_idx, start, window_size = self.consecutive_windows[idx]
+                ids = list(range(start, start + window_size))
+                return {
+                    'seq_idx': seq_idx,
+                    'ids': ids,
+                    'num_frames': window_size,
+                    'sampling_type': 'consecutive',
+                    'window_size': window_size,
+                }
+
+        # Use varied spacing (original method with ids=None)
+        seq_idx = iteration % len(self.dataset.sequence_list)
+        num_frames = 8
+        return {
+            'seq_idx': seq_idx,
+            'ids': None,  # Let dataset handle sampling
+            'num_frames': num_frames,
+            'sampling_type': 'varied',
+            'window_size': num_frames,
+        }
 
 
 def run_training(args):
@@ -247,7 +341,12 @@ def run_training(args):
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     # Setup TensorBoard
-    aug_suffix = "_aug" if args.augment_consecutive else ""
+    aug_parts = []
+    if args.augment_consecutive:
+        aug_parts.append("cons")
+    if args.augment_two_cluster:
+        aug_parts.append("2cl")
+    aug_suffix = ("_" + "_".join(aug_parts)) if aug_parts else ""
     run_name = f"uncertainty{aug_suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     log_dir = os.path.join(args.log_dir, run_name)
     writer = SummaryWriter(log_dir)
@@ -270,7 +369,9 @@ def run_training(args):
                 "lr": args.lr,
                 "clamp_residual": args.clamp_residual,
                 "augment_consecutive": args.augment_consecutive,
+                "augment_two_cluster": args.augment_two_cluster,
                 "consecutive_ratio": args.consecutive_ratio,
+                "two_cluster_ratio": args.two_cluster_ratio,
                 "window_sizes": args.window_sizes,
                 "tum_sequences": args.tum_sequences,
             }
@@ -293,7 +394,7 @@ def run_training(args):
     common_conf_exact = MockCommonConf(get_nearby=False)
 
     # Determine minimum frames needed
-    if args.augment_consecutive:
+    if args.augment_consecutive or args.augment_two_cluster:
         min_frames = max(args.window_sizes)  # Need at least max window size
     else:
         min_frames = args.num_frames
@@ -318,11 +419,12 @@ def run_training(args):
 
     # Setup augmented sampler if requested
     sampler = None
-    if args.augment_consecutive:
+    if args.augment_consecutive or args.augment_two_cluster:
         sampler = AugmentedDataSampler(
             dataset=dataset_nearby,
             window_sizes=args.window_sizes,
-            consecutive_ratio=args.consecutive_ratio,
+            consecutive_ratio=args.consecutive_ratio if args.augment_consecutive else 0.0,
+            two_cluster_ratio=args.two_cluster_ratio if args.augment_two_cluster else 0.0,
             seed=42,
         )
 
@@ -368,7 +470,7 @@ def run_training(args):
     model.train()
 
     # Track sampling statistics
-    sampling_stats = {'varied': 0, 'consecutive': 0}
+    sampling_stats = {'varied': 0, 'consecutive': 0, 'two_cluster': 0}
     window_size_stats = {ws: 0 for ws in args.window_sizes}
 
     for iteration in range(start_iteration, args.num_iters):
@@ -381,14 +483,14 @@ def run_training(args):
             sampling_type = sample_info['sampling_type']
 
             # Use appropriate dataset based on sampling type
-            if sampling_type == 'consecutive':
+            if sampling_type in ('consecutive', 'two_cluster'):
                 dataset = dataset_exact
             else:
                 dataset = dataset_nearby
 
             # Track statistics
             sampling_stats[sampling_type] += 1
-            if sampling_type == 'consecutive':
+            if sampling_type in ('consecutive', 'two_cluster'):
                 window_size_stats[sample_info['window_size']] += 1
         else:
             # Original method: varied spacing
@@ -536,7 +638,8 @@ def run_training(args):
 
         # Console output
         if step % args.log_interval == 0 or step == 1:
-            sample_info_str = f"[{sampling_type[:4]}:{num_frames}f]" if sampler else ""
+            type_abbrev = {'varied': 'vari', 'consecutive': 'cons', 'two_cluster': '2clu'}
+            sample_info_str = f"[{type_abbrev.get(sampling_type, sampling_type[:4])}:{num_frames}f]" if sampler else ""
             print(f"Iter {step:4d} {sample_info_str} | loss: {loss.item():.4f} | "
                   f"rot_nll: {loss_dict['rot_uncertainty_nll'].item():.3f} | "
                   f"trans_nll: {loss_dict['trans_uncertainty_nll'].item():.3f} | "
@@ -548,6 +651,7 @@ def run_training(args):
         if sampler is not None and step % (args.log_interval * 10) == 0:
             writer.add_scalar('sampling/varied_ratio', sampling_stats['varied'] / max(step, 1), step)
             writer.add_scalar('sampling/consecutive_ratio', sampling_stats['consecutive'] / max(step, 1), step)
+            writer.add_scalar('sampling/two_cluster_ratio', sampling_stats['two_cluster'] / max(step, 1), step)
             for ws in args.window_sizes:
                 writer.add_scalar(f'sampling/window_{ws}', window_size_stats[ws], step)
 
@@ -599,10 +703,11 @@ def run_training(args):
         print(f"  - best.pt (calibration_error={best_calibration_error:.2f})")
         print(f"  - final.pt")
     if sampler is not None:
-        total = sampling_stats['varied'] + sampling_stats['consecutive']
+        total = sampling_stats['varied'] + sampling_stats['consecutive'] + sampling_stats['two_cluster']
         print(f"\nSampling statistics:")
-        print(f"  - Varied spacing: {sampling_stats['varied']} ({100*sampling_stats['varied']/total:.1f}%)")
-        print(f"  - Consecutive: {sampling_stats['consecutive']} ({100*sampling_stats['consecutive']/total:.1f}%)")
+        print(f"  - Varied spacing: {sampling_stats['varied']} ({100*sampling_stats['varied']/max(total,1):.1f}%)")
+        print(f"  - Consecutive: {sampling_stats['consecutive']} ({100*sampling_stats['consecutive']/max(total,1):.1f}%)")
+        print(f"  - Two-cluster: {sampling_stats['two_cluster']} ({100*sampling_stats['two_cluster']/max(total,1):.1f}%)")
         for ws in args.window_sizes:
             if window_size_stats[ws] > 0:
                 print(f"    - Window {ws}: {window_size_stats[ws]}")
@@ -644,11 +749,26 @@ def main():
                         help='Ratio of consecutive vs varied sampling (0-1)')
     parser.add_argument('--window_sizes', type=int, nargs='+', default=[8, 16, 32, 64],
                         help='Window sizes for consecutive sampling')
+    # Two-cluster sampling arguments
+    parser.add_argument('--augment_two_cluster', action='store_true',
+                        help='Enable two-cluster sampling (mimics loop closure windows)')
+    parser.add_argument('--two_cluster_ratio', type=float, default=0.33,
+                        help='Ratio of two-cluster sampling when enabled (default 0.33)')
     # Multi-sequence support
     parser.add_argument('--tum_sequences', type=str, nargs='+', default=None,
                         help='List of TUM sequence names to train on (e.g. rgbd_dataset_freiburg1_desk '
                              'rgbd_dataset_freiburg1_room). If not set, uses all sequences found in tum_dir.')
     args = parser.parse_args()
+
+    # Normalize ratios when both augmentations are enabled
+    if args.augment_consecutive and args.augment_two_cluster:
+        total_ratio = args.consecutive_ratio + args.two_cluster_ratio
+        if total_ratio > 1.0:
+            args.consecutive_ratio /= total_ratio
+            args.two_cluster_ratio /= total_ratio
+            logger.info(f"Normalized ratios: consecutive={args.consecutive_ratio:.2f}, "
+                        f"two_cluster={args.two_cluster_ratio:.2f}, "
+                        f"varied={1.0 - args.consecutive_ratio - args.two_cluster_ratio:.2f}")
 
     run_training(args)
 
