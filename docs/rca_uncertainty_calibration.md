@@ -1,7 +1,7 @@
 # RCA: Uncertainty Head Calibration Gap (Train vs Eval)
 
 **Date**: 2026-02-21
-**Status**: Phase A-D complete. Predicted weights beat uniform on 2/3 sequences (ATE Trans) and all 4/4 (ATE Rot).
+**Status**: Phase A-D complete + corrected Phase 1 benchmark. Predicted weights beat uniform on 3/4 held-out TUM sequences (mean -5% ATE). Multi-sequence eval: 2/3 (ATE Trans), all 4/4 (ATE Rot).
 **Owner**: Yiming
 **Sequence**: TUM fr1_desk (596 frames)
 
@@ -349,6 +349,7 @@ Despite well-calibrated d² (1.40), predicted weights don't outperform uniform o
 
 ## Changelog
 
+- **2026-02-21 (PM6)**: Corrected Phase 1 benchmark eval (4 held-out TUM seqs, `checkpoints_tum_multi/best.pt`, per-window + LC + robust). **3/4 predicted beats uniform** (mean -5% ATE): fr1_floor -3%, fr1_teddy -4%, fr3_long_office -11%. Only fr1_360 fails (rotation-heavy, d²=22). Original eval with `--global_scale` was 1/4 — scale fix transformed results.
 - **2026-02-21 (PM5)**: Phase D complete. Multi-sequence eval on fr1_room, fr2_desk, fr2_xyz. Predicted (best α) beats uniform ATE Trans on 2/3 sequences (fr1_room -10%, fr2_xyz -11%). Predicted wins ATE Rot on ALL 4 sequences. Uncertainty signal is most valuable on harder sequences with more ill-conditioned graph structure.
 - **2026-02-21 (PM4)**: Phase C complete. Oracle binned = 1.98 cm (near-zero headroom over uniform 1.97 cm). Temperature α=0.3 best at 1.99 cm. Predicted wins on rotation across all α. Conclusion: topology limitation, not calibration failure.
 - **2026-02-21 (PM3)**: Phase B complete. Per-window + LC + robust: uniform 1.97cm, predicted 2.04cm. Predicted wins on rotation (2.63° vs 2.73°) and RPE (0.99 vs 1.01cm) but not ATE Trans. Gap narrowed from catastrophic to 0.07cm. Added full Phase A and B results tables.

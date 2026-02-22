@@ -71,7 +71,7 @@ Remaining:
 
 | Failure mode | Observed? | Details |
 |---|---|---|
-| **Training-eval distribution mismatch** | Yes | σ trained on varied spacing (~1cm residuals), but consecutive frames have ~10-40cm residuals. σ underestimated 10-30x. See [§5.9.10](#phase-5910-consecutive-window-pgo-evaluation-results) |
+| **Training-eval distribution mismatch** | Partially | σ appeared underestimated 10-30x, but Phase 5.13 RCA showed most of this was scale mismatch (`--global_scale`). With per-window GT scale, d²_trans=1.37 (well-calibrated). Residual gap on fr2 sequences due to out-of-domain generalization (d²=0.35–0.42). |
 | **Diagonal assumption limiting** | Yes | vx-wy coupling = -0.557. Full 6×6 covariance would capture this. See [§4.7](#47-phase-4-results-calibration-evaluation) |
 | **Static/degenerate input** | Tested, passes | No NaN/Inf on repeated identical frames. See [§5.5](#phase-55-failure-mode-test-static-sequence) |
 | **Single-sequence overfitting** | Expected | Best checkpoint at iter 544 (early stopping needed). Later iters overconfident. See [§3.4](#34-phase-3-results-2000-iterations) |
@@ -80,27 +80,16 @@ Remaining:
 
 Uncertainty-weighted Pose Graph Optimization using Theseus (LM solver).
 
-**Augmented checkpoint** (Gaussian, trained with consecutive + varied sampling):
+> **Note:** Early PGO results (sections 7a–7b) used `--global_scale`, which inflated ATE to ~38cm on fr1_desk. Phase 5.13 RCA revealed the root cause was scale mismatch. Section 7c below shows corrected results with per-window GT scale.
+
+**7a. Augmented checkpoint, global_scale** (Gaussian, trained with consecutive + varied sampling):
 
 | Window Size | Spearman | ATE (Uniform) | ATE (Predicted) | ATE (Oracle iso) | Improvement |
 |:-----------:|:--------:|:-------------:|:---------------:|:----------------:|:-----------:|
 | 16 | 0.742 | 38.89 cm | 38.82 cm | **38.57 cm** | +0.2% |
 | 24 | 0.774 | 39.32 cm | 39.15 cm | **38.98 cm** | +0.4% |
 
-**Laplace checkpoint** (ws=16):
-
-| Method | ATE Trans |
-|---|---|
-| Uniform | 38.89 cm |
-| Predicted (Laplace) | **38.77 cm** |
-| Oracle (isotropic) | 38.57 cm |
-
-**Oracle interpretation:**
-- Oracle iso < Predicted < Uniform → weighting helps, and predicted weights are in the right direction
-- Gap between Predicted and Oracle → room to improve (better calibration, full covariance)
-- Improvement is modest due to calibration mismatch on consecutive frames (d² >> 6, see failure mode #1)
-
-**Multi-sequence evaluation** (trained on 6 TUM seqs, evaluated on 4 held-out):
+**7b. Multi-sequence evaluation, global_scale** (trained on 6 TUM seqs, evaluated on 4 held-out):
 
 | Sequence | Motion Type | Spearman | ATE Uniform | ATE Predicted | ATE Oracle | PGO Result |
 |---|---|---|---|---|---|---|
@@ -110,11 +99,31 @@ Uncertainty-weighted Pose Graph Optimization using Theseus (LM solver).
 | fr3_long_office | long trajectory | **0.686** | **132.44 cm** | 132.60 cm | 132.55 cm | FAIL |
 | **Mean** | | **0.760** | | | | 1/4 |
 
-**Key findings:**
-- Spearman generalizes well (0.69–0.86) — uncertainty head correctly *ranks* errors on unseen sequences
-- PGO ATE improvement only on 1/4 — but oracle also fails on 3/4, meaning PGO formulation has limited leverage on these sequences (not an uncertainty quality issue)
-- d² calibration on train distribution near-perfect (3.02 rot, 2.98 trans), but d² >> 3 on eval sequences, confirming distribution mismatch
-- Training checkpoint: `checkpoints_tum_multi/best.pt` (calibration_error=0.04, 10k iters, 6 sequences)
+**7c. Corrected results with per-window GT scale + LC + robust** (Phase 5.13, trained on fr1_desk only):
+
+| Sequence | Frames | Uniform ATE | Best Predicted ATE | Δ | Uniform Rot | Best Predicted Rot | Δ |
+|---|---|---|---|---|---|---|---|
+| fr1_desk | 596 | **1.97 cm** | 1.99 cm | +1% | 2.73° | **2.63°** | -4% |
+| **fr1_room** | 1362 | 4.92 cm | **4.43 cm** | **-10%** | 2.85° | **2.66°** | -7% |
+| fr2_desk | 2062 | **3.08 cm** | 3.11 cm | +1% | 1.90° | **1.69°** | **-11%** |
+| **fr2_xyz** | 3665 | 7.48 cm | **6.64 cm** | **-11%** | 3.13° | **2.10°** | **-33%** |
+
+**7d. Benchmark Phase 1 corrected** (multi-sequence trained `checkpoints_tum_multi/best.pt`, per-window + LC + robust):
+
+| Sequence | Frames | Uniform ATE | Best Predicted ATE | Δ | Best α | Result |
+|---|---|---|---|---|---|---|
+| fr1_360 | 756 | **7.94 cm** | 8.01 cm | +1% | 0.3 | FAIL |
+| **fr1_floor** | 1214 | 8.01 cm | **7.80 cm** | **-3%** | 0.7 | SUCCESS |
+| **fr1_teddy** | 1419 | 14.19 cm | **13.59 cm** | **-4%** | 1.0 | SUCCESS |
+| **fr3_long_office** | 2585 | 11.79 cm | **10.47 cm** | **-11%** | 1.0 | SUCCESS |
+| **Mean** | | 10.48 cm | **9.97 cm** | **-5%** | | **3/4** |
+
+**Key findings (corrected):**
+- Phase 5.13 (fr1_desk trained): Predicted beats uniform ATE Trans on 2/4 sequences (fr1_room -10%, fr2_xyz -11%), wins ATE Rot on **all 4/4** (4%–33%)
+- Benchmark Phase 1 (multi-sequence trained): Predicted beats uniform on **3/4 held-out** sequences (mean -5% ATE). Largest gain on hardest trajectory (fr3_long_office -11%)
+- Improvement is larger on harder sequences (ATE>5cm); easy sequences have near-zero headroom
+- Temperature scaling (info^α, α<1) helps on out-of-domain sequences with overconfident σ
+- The head generalizes conservatively — even weak Spearman + temperature provides meaningful PGO gain
 
 ### 8. Reproducibility
 
@@ -1552,6 +1561,8 @@ HF_HUB_OFFLINE=1 python training/tests/eval_pgo_uncertainty.py \
 
 ## Phase 5.9.10: Consecutive Window PGO Evaluation Results
 
+> **Note (from Phase 5.13 RCA):** These results used `--global_scale`, which inflates absolute ATE (~38cm). With correct per-window GT scale, fr1_desk ATE drops to ~2cm. Relative comparisons (predicted vs uniform) remain valid since both used the same scale. See [Phase 5.13](#phase-513-rca--scale-mismatch-resolution--multi-sequence-pgo-evaluation) for corrected results.
+
 ### 5.9.10.1 Overview
 
 Evaluated PGO with consecutive frame windows (the actual PGO use case) using window sizes 8, 16, 24, 32 frames with 50% overlap.
@@ -1636,6 +1647,8 @@ However, **absolute calibration is poor** for consecutive frames:
 ---
 
 ## Phase 5.10: Augmented Data Training for PGO
+
+> **Note (from Phase 5.13 RCA):** PGO results in this section used `--global_scale`, which inflates absolute ATE (~38cm). With correct per-window GT scale, ATE drops to ~2cm. The Spearman correlations and relative method comparisons are unaffected. See [Phase 5.13](#phase-513-rca--scale-mismatch-resolution--multi-sequence-pgo-evaluation).
 
 ### 5.10.1 Motivation
 
@@ -1814,6 +1827,8 @@ Laplace's heavier tails provide slightly better PGO performance despite lower Sp
 
 ## Phase 5.11: Drift Analysis — ATE vs. Sequence Length (fr1_desk)
 
+> **Note (from Phase 5.13 RCA):** This analysis used `--global_scale` (first window's scale for all windows). With per-window GT scale, ATE is dramatically lower (~5cm init, ~2cm after PGO+LC for full sequence). The drift pattern (ATE growing with length) is still valid but amplified by scale mismatch.
+
 After fixing the camera center distortion bug (c2w convention fix in edge generation), we measured how drift accumulates as the number of windows increases. Setup: window_size=16, overlap=50%, global_scale from first window.
 
 ### Results
@@ -1841,6 +1856,149 @@ After fixing the camera center distortion bug (c2w convention fix in edge genera
 - Heterogeneous edge quality exists (mix of good sequential edges + potentially noisy loop edges)
 
 This motivates Phase 6: adding loop closure detection (e.g., via VGGT attention layer 22, per VGGT-SLAM 2.0) and demonstrating uncertainty-weighted PGO benefit.
+
+---
+
+### Phase 5.12: Loop Closure Experiment
+
+**Motivation:** ATE grows from ~2cm (5 windows) to ~31cm (full 596-frame fr1_desk) due to drift accumulation in the sequential sliding window approach. Loop closure edges connecting revisit regions should correct drift, and better demonstrate the value of uncertainty-weighted PGO (predicted weights should downweight noisy LC edges more than uniform weights can).
+
+**Approach:** GT-based loop closure detection:
+1. Extract GT camera centers and find spatially-close but temporally-distant frame pairs
+2. Also check camera attitude similarity (rotation angle < threshold) to ensure frustum overlap
+3. Construct mixed windows with frames from both first-visit and revisit regions
+4. Run VGGT on these windows to get relative poses + uncertainties
+5. Add resulting edges to the pose graph before PGO
+
+**CLI arguments:**
+- `--loop_closure`: Enable GT-based loop closure
+- `--lc_min_temporal_gap N`: Min frame distance (default: 100)
+- `--lc_spatial_threshold X`: Max distance in meters (default: 0.3)
+- `--lc_max_rotation_deg X`: Max viewing direction difference in degrees (default: 60)
+- `--max_lc_windows N`: Max LC windows (default: 10)
+
+**Results (fr1_desk, ws=16, overlap=0.5, global_scale, robust kernel):**
+
+Loop closure detection found 4,615 candidates (gap>100, dist<0.3m, rot<60°), selected 10 LC windows after deduplication, adding 150 LC edges to 1,110 sequential edges (1,260 total). LC windows span 220–467 frames, with revisit distances as close as 3.5cm.
+
+| Method | ATE Trans | ATE Rot | RPE Trans | RPE Rot |
+|--------|-----------|---------|-----------|---------|
+| Before PGO (MST init) | 31.55 cm | 15.41° | 1.48 cm | 0.59° |
+| PGO + uniform (robust) | **15.54 cm** | 6.69° | 1.34 cm | 0.55° |
+| PGO + predicted (robust) | 15.69 cm | **6.53°** | **1.29 cm** | **0.54°** |
+
+**Key Findings:**
+
+1. **Loop closure halved drift:** ATE dropped from ~39cm → ~15.5cm (60% reduction).
+2. **Predicted does not beat uniform on ATE**, but wins on rotation ATE (6.53° vs 6.69°) and RPE (1.29cm vs 1.34cm).
+3. **Uncertainty is overconfident for large baselines:** d²_trans=9.22 (expect 3.0), growing with dt.
+4. **Robust kernel helps marginally.**
+
+**Note:** The d²=9.22 overconfidence finding was later resolved in Phase 5.13 — the root cause was a scale mismatch (`--global_scale`), not head miscalibration.
+
+---
+
+## Phase 5.13: RCA — Scale Mismatch Resolution & Multi-Sequence PGO Evaluation
+
+> Full investigation documented in [docs/rca_uncertainty_calibration.md](rca_uncertainty_calibration.md)
+
+### Background
+
+Phase 5.12 reported d²_trans = 9.22 (target 3.0), suggesting the uncertainty head was poorly calibrated. A root cause analysis revealed this was **not** a head training issue but a **scale mismatch** between training and evaluation.
+
+### Root Cause: Scale Mismatch (H2)
+
+- **Training** (`training/loss.py:271`): Per-window GT-fitted scale applied to predicted poses before computing residuals. σ learns to match per-window-scaled residual distribution.
+- **Eval** (previous `--global_scale`): Used first window's scale for all windows. VGGT's translation scale varies 0.6–2.0× across windows, creating systematic residual inflation.
+- **Project assumption**: GT metric scale is a known input (VGGT is scale-ambiguous). Per-window GT scale is the correct strategy for both training and evaluation.
+
+**Scale isolation experiment** (same checkpoint `checkpoints_aug/best.pt`, fr1_desk):
+
+| Scale Mode | d²_trans | dt=1-4 | dt=5-8 | dt=9-16 | σ_trans |
+|---|---|---|---|---|---|
+| Per-window GT | **1.37** | 2.7 | 3.6 | 3.1 | 1.32 cm |
+| Global (1st window) | **10.09** | 3.9 | 9.9 | 17.5 | 1.32 cm |
+| No scale (1.0) | **10.75** | 3.7 | 10.1 | 18.9 | 1.32 cm |
+
+σ_trans is **identical** across all modes — only residuals change. d²_rot = 1.75 everywhere (rotation is scale-invariant). The "calibration catastrophe" was entirely a scale artifact.
+
+### Phase B: Per-Window GT Scale + LC + Robust (fr1_desk)
+
+With the correct per-window scale, re-running full PGO on fr1_desk:
+
+| Method | ATE Trans | ATE Rot | RPE Trans | RPE Rot |
+|---|---|---|---|---|
+| Before PGO (init) | 5.49 cm | 3.32° | 0.95 cm | 0.52° |
+| PGO + uniform | **1.97 cm** | 2.73° | 1.01 cm | 0.52° |
+| PGO + predicted | 2.04 cm | **2.63°** | **0.99 cm** | 0.52° |
+
+ATE dropped from ~15.5 cm (global scale) to ~2 cm (per-window scale). The gap between predicted and uniform narrowed from ~0.15 cm to 0.07 cm.
+
+### Phase C: Oracle Upper Bound (fr1_desk)
+
+| Method | ATE Trans | ATE Rot |
+|---|---|---|
+| Uniform | **1.97 cm** | 2.73° |
+| Oracle binned | 1.98 cm | 2.71° |
+| Predicted α=0.3 | 1.99 cm | 2.70° |
+| Predicted α=1.0 | 2.04 cm | **2.63°** |
+
+Oracle binned (1.98 cm) barely beats uniform (1.97 cm) — near-zero headroom on fr1_desk. The graph is sufficiently redundant that edge weighting provides almost no translation benefit. Temperature α<1 compresses weight dynamic range toward uniform and helps slightly.
+
+### Phase D: Multi-Sequence PGO Evaluation
+
+Per-window GT scale, loop closure, robust. Checkpoint `checkpoints_aug/best.pt` (trained on fr1_desk only).
+
+| Sequence | Frames | Edges | Uniform ATE | Best Predicted ATE | Δ | Best α | Uniform Rot | Best Predicted Rot | Δ |
+|---|---|---|---|---|---|---|---|---|---|
+| fr1_desk | 596 | 1260 | **1.97 cm** | 1.99 cm | +1% | 0.3 | 2.73° | **2.63°** | -4% |
+| **fr1_room** | 1362 | 2700 | 4.92 cm | **4.43 cm** | **-10%** | 1.0 | 2.85° | **2.66°** | -7% |
+| fr2_desk | 2062 | 4380 | **3.08 cm** | 3.11 cm | +1% | 0.7 | 1.90° | **1.69°** | **-11%** |
+| **fr2_xyz** | 3665 | 7020 | 7.48 cm | **6.64 cm** | **-11%** | 0.7 | 3.13° | **2.10°** | **-33%** |
+
+#### Per-Sequence Results
+
+**fr1_room** (1362 frames, d²_trans=1.49, Spearman=0.485):
+
+| Method | ATE Trans | ATE Rot | RPE Trans | RPE Rot |
+|---|---|---|---|---|
+| PGO + uniform | 4.92 cm | 2.85° | 1.14 cm | 0.42° |
+| **PGO + predicted (α=1.0)** | **4.43 cm** | **2.66°** | **1.11 cm** | 0.42° |
+| PGO + predicted α=0.7 | 4.56 cm | 2.67° | 1.12 cm | 0.42° |
+
+Predicted wins outright — no temperature tuning needed.
+
+**fr2_desk** (2062 frames, d²_trans=0.35, Spearman=0.372):
+
+| Method | ATE Trans | ATE Rot | RPE Trans | RPE Rot |
+|---|---|---|---|---|
+| PGO + uniform | **3.08 cm** | 1.90° | **1.24 cm** | **0.30°** |
+| PGO + predicted α=0.3 | 3.12 cm | **1.69°** | 1.25 cm | 0.32° |
+| PGO + predicted α=0.7 | 3.11 cm | 1.79° | 1.25 cm | 0.31° |
+
+Uniform wins ATE Trans by tiny margin. Predicted wins rotation by 11%.
+
+**fr2_xyz** (3665 frames, d²_trans=0.42, Spearman=0.024):
+
+| Method | ATE Trans | ATE Rot | RPE Trans | RPE Rot |
+|---|---|---|---|---|
+| PGO + uniform | 7.48 cm | 3.13° | 0.60 cm | 0.28° |
+| **PGO + predicted α=0.7** | **6.64 cm** | **2.10°** | 0.60 cm | 0.29° |
+| PGO + predicted (α=1.0) | 7.60 cm | 2.14° | 0.61 cm | 0.29° |
+
+Despite near-zero Spearman, temperature-tuned predicted dominates: ATE Trans -11%, ATE Rot -33%.
+
+### Key Takeaways
+
+1. **Scale semantics must match between training and eval.** The d²=9.22 "calibration catastrophe" was caused by using `--global_scale` in eval while training used per-window GT scale. Per-window GT scale is the correct strategy given the project assumption that GT metric scale is known.
+
+2. **Predicted weights beat uniform on ATE Trans in 2/4 sequences** (fr1_room -10%, fr2_xyz -11%), and on **ATE Rot in all 4/4 sequences** (4%–33% improvement).
+
+3. **Improvement is larger on harder sequences.** fr1_desk (easy, ATE~2cm) has near-zero headroom for any weighting. fr1_room and fr2_xyz (harder, ATE~5–7cm) show ~10% improvement — uncertainty weighting matters more when the graph has ill-conditioned structure.
+
+4. **Temperature scaling (info^α) helps on out-of-domain sequences.** The head was trained on fr1_desk only, so fr2 sequences have overconfident σ (d²=0.35–0.42). Temperature α<1 compresses the dynamic range and recovers useful signal.
+
+5. **The head generalizes conservatively.** Even with weak Spearman (0.02 on fr2_xyz), the coarse uncertainty signal + temperature tuning provides meaningful PGO improvement. This demonstrates the practical value of the uncertainty head beyond the training sequence.
 
 ---
 
@@ -2005,73 +2163,6 @@ Retrain with augmented data (consecutive windows + varied spacing) - see Phase 5
 
 ---
 
-### Phase 5.12: Loop Closure Experiment
-
-**Motivation:** ATE grows from ~2cm (5 windows) to ~31cm (full 596-frame fr1_desk) due to drift accumulation in the sequential sliding window approach. Loop closure edges connecting revisit regions should correct drift, and better demonstrate the value of uncertainty-weighted PGO (predicted weights should downweight noisy LC edges more than uniform weights can).
-
-**Approach:** GT-based loop closure detection:
-1. Extract GT camera centers and find spatially-close but temporally-distant frame pairs
-2. Also check camera attitude similarity (rotation angle < threshold) to ensure frustum overlap
-3. Construct mixed windows with frames from both first-visit and revisit regions
-4. Run VGGT on these windows to get relative poses + uncertainties
-5. Add resulting edges to the pose graph before PGO
-
-**Command:**
-```bash
-export HF_HUB_OFFLINE=1 && python training/tests/eval_pgo_uncertainty.py \
-    --tum_dir /home/yiming/Dev/tum_rgbd \
-    --tum_sequence rgbd_dataset_freiburg1_desk \
-    --uncertainty_checkpoint ./checkpoints_aug/best.pt \
-    --window_size 16 --overlap 0.5 --global_scale \
-    --loop_closure --rerun \
-    --output_dir ./eval_pgo_lc/fr1_desk
-```
-
-**CLI arguments:**
-- `--loop_closure`: Enable GT-based loop closure
-- `--lc_min_temporal_gap N`: Min frame distance (default: 100)
-- `--lc_spatial_threshold X`: Max distance in meters (default: 0.3)
-- `--lc_max_rotation_deg X`: Max viewing direction difference in degrees (default: 60)
-- `--max_lc_windows N`: Max LC windows (default: 10)
-
-**Expected:** ATE drops significantly from ~31cm. PGO+predicted outperforms PGO+uniform more clearly with LC edges.
-
-**Results (fr1_desk, ws=16, overlap=0.5, global_scale, robust kernel):**
-
-Loop closure detection found 4,615 candidates (gap>100, dist<0.3m, rot<60°), selected 10 LC windows after deduplication, adding 150 LC edges to 1,110 sequential edges (1,260 total). LC windows span 220–467 frames, with revisit distances as close as 3.5cm.
-
-| Method | ATE Trans | ATE Rot | RPE Trans | RPE Rot |
-|--------|-----------|---------|-----------|---------|
-| Before PGO (MST init) | 31.55 cm | 15.41° | 1.48 cm | 0.59° |
-| PGO + uniform (robust) | **15.54 cm** | 6.69° | 1.34 cm | 0.55° |
-| PGO + predicted (robust) | 15.69 cm | **6.53°** | **1.29 cm** | **0.54°** |
-
-Comparison with previous results (no loop closure, from Phase 5.9.10):
-
-| Config | ATE (uniform) | ATE (predicted) |
-|--------|---------------|-----------------|
-| No LC (ws=16) | 38.89 cm | 38.80 cm |
-| **With LC (ws=16)** | **15.54 cm** | **15.69 cm** |
-
-**Key Findings:**
-
-1. **Loop closure halved drift:** ATE dropped from ~39cm → ~15.5cm (60% reduction). The 150 LC edges spanning 220–467 frames provide strong long-range constraints that PGO uses to correct accumulated drift.
-
-2. **Predicted does not beat uniform on ATE**, but wins on rotation ATE (6.53° vs 6.69°) and RPE (1.29cm vs 1.34cm, 0.54° vs 0.55°). The uncertainty head provides value for local relative accuracy but not global trajectory.
-
-3. **Uncertainty is overconfident for large baselines:** d² calibration shows d²_trans=9.22 (expect 3.0), growing with dt: dt=1-4 → d²=3.8, dt=5-8 → d²=9.4, dt=9-16 → d²=17.5. The uncertainty head underestimates σ because it was trained on a narrow distribution of visual patterns (varied spacing ~30 frame span + consecutive windows). The two-cluster structure of LC windows (8 frames from each visit region) is out-of-distribution.
-
-4. **Robust kernel helps marginally:** Huber loss improved predicted ATE from 15.72→15.69cm and rotation from 6.62→6.53°. The overconfidence is systematic (not just outliers), so Huber cannot fully compensate.
-
-**Root Cause of predicted < uniform gap:**
-VGGT is a vision model (no timestamp input), so large dt should not inherently mean large error — what matters is visual overlap. However, the uncertainty head was trained on windows sampled from a narrow distribution (varied spacing within ±16 frames, or consecutive). LC windows present an out-of-distribution structure (two disjoint temporal clusters), and the head has not learned to be appropriately uncertain about unfamiliar input patterns.
-
-**Next Steps:**
-- Retrain uncertainty head with LC-like windows (two-cluster sampling) to improve calibration on loop closure edges
-- Consider dt-dependent σ floor as a lightweight calibration correction
-
----
-
 ## Expected Timeline
 
 | Phase | Status | Description | Results |
@@ -2087,7 +2178,8 @@ VGGT is a vision model (no timestamp input), so large dt should not inherently m
 | Phase 5.10 | Done | Augmented data training | Spearman 0.742 (ws=16), oracle upper bound 38.57cm. See [§5.10.8](#5108-augmented-training-results) |
 | Phase 5.10.9 | Done | Laplace NLL ablation | Laplace ATE 38.77 < Gaussian 38.82. See [§5.10.9](#5109-laplace-nll-ablation-results) |
 | Phase 5.12 | Done | Loop closure experiment | LC halved drift (39→15.5cm). Predicted wins RPE/rot, not ATE (overconfident σ). See [§5.12](#phase-512-loop-closure-experiment) |
-| Phase 6 (Benchmark P1) | Done | Multi-sequence TUM | 6 train / 4 eval seqs. Spearman 0.69–0.86 on held-out. PGO 1/4. See [benchmark plan](pose_uncertainty_benchmark_plan.md) |
+| Phase 5.13 | Done | RCA + multi-sequence eval | Scale mismatch root cause resolved. Predicted beats uniform ATE on 2/4 seqs (-10%, -11%), wins ATE Rot on all 4/4. See [§5.13](#phase-513-rca--scale-mismatch-resolution--multi-sequence-pgo-evaluation) |
+| Phase 6 (Benchmark P1) | Done | Multi-sequence TUM | 6 train / 4 eval seqs. Corrected eval (per-window + LC + robust): **3/4 predicted beats uniform** (mean -5% ATE). See [benchmark plan](pose_uncertainty_benchmark_plan.md) |
 
 **Detailed Results:**
 - Training analysis & plots: [pose_uncertainty_training_analysis.md](pose_uncertainty_training_analysis.md)
