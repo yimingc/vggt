@@ -156,3 +156,7 @@ runs/
 
 # TUM evaluation output
 tum_eval_output/
+
+# Uncertainty head checkpoints and eval outputs
+checkpoints*/
+eval_*/
