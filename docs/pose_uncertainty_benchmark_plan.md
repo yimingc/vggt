@@ -141,7 +141,9 @@ done
 
 ### 1.5 Results (Phase 1) — 2026-02-21
 
-Per-window GT scale fixes the scale mismatch artifact (see [RCA doc](rca_uncertainty_calibration.md)). Loop closure and robust (Huber) kernel added. Temperature sweep α ∈ {0.3, 0.5, 0.7, 1.0}.
+**Training:** 10k iters, Gaussian NLL + augmented consecutive sampling, best checkpoint calibration_error=0.04 (d²_rot=3.02, d²_trans=2.98).
+
+**Eval settings:** Per-window GT scale, loop closure, robust (Huber) kernel. Temperature sweep α ∈ {0.3, 0.5, 0.7, 1.0}.
 
 | Sequence | Frames | Edges | Spearman | d²_trans | d²_rot | Uniform ATE | Best Predicted ATE | Δ | Best α | Result |
 |---|---|---|---|---|---|---|---|---|---|---|
